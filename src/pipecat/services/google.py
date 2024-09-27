@@ -5,30 +5,29 @@
 #
 
 import asyncio
-
 from typing import List
+
+from loguru import logger
 
 from pipecat.frames.frames import (
     Frame,
-    LLMModelUpdateFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
+    LLMUpdateSettingsFrame,
     TextFrame,
     VisionImageRawFrame,
-    LLMMessagesFrame,
-    LLMFullResponseStartFrame,
-    LLMFullResponseEndFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ai_services import LLMService
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
-
-from loguru import logger
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.ai_services import LLMService
 
 try:
-    import google.generativeai as gai
     import google.ai.generativelanguage as glm
+    import google.generativeai as gai
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -129,9 +128,10 @@ class GoogleLLMService(LLMService):
             context = OpenAILLMContext.from_messages(frame.messages)
         elif isinstance(frame, VisionImageRawFrame):
             context = OpenAILLMContext.from_image_frame(frame)
-        elif isinstance(frame, LLMModelUpdateFrame):
-            logger.debug(f"Switching LLM model to: [{frame.model}]")
-            self._create_client(frame.model)
+        elif isinstance(frame, LLMUpdateSettingsFrame):
+            if frame.model is not None:
+                logger.debug(f"Switching LLM model to: [{frame.model}]")
+                self.set_model_name(frame.model)
         else:
             await self.push_frame(frame, direction)
 
