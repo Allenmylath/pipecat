@@ -5,47 +5,47 @@
 #
 
 import base64
-import json
-import io
 import copy
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
-from PIL import Image
-from asyncio import CancelledError
+import io
+import json
 import re
+from asyncio import CancelledError
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from pipecat.frames.frames import (
     Frame,
-    LLMEnablePromptCachingFrame,
-    LLMModelUpdateFrame,
-    TextFrame,
-    VisionImageRawFrame,
-    UserImageRequestFrame,
-    UserImageRawFrame,
-    LLMMessagesFrame,
-    LLMFullResponseStartFrame,
-    LLMFullResponseEndFrame,
-    FunctionCallResultFrame,
     FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    LLMEnablePromptCachingFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
+    LLMModelUpdateFrame,
     StartInterruptionFrame,
+    TextFrame,
+    UserImageRawFrame,
+    UserImageRequestFrame,
+    VisionImageRawFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ai_services import LLMService
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantContextAggregator,
+    LLMUserContextAggregator,
+)
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
-from pipecat.processors.aggregators.llm_response import (
-    LLMUserContextAggregator,
-    LLMAssistantContextAggregator,
-)
-
-from loguru import logger
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.ai_services import LLMService
 
 try:
-    from anthropic import AsyncAnthropic, NOT_GIVEN, NotGiven
+    from anthropic import NOT_GIVEN, AsyncAnthropic, NotGiven
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -565,7 +565,7 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
         run_llm = False
 
         aggregation = self._aggregation
-        self._aggregation = ""
+        self._reset()
 
         try:
             if self._function_call_result:
@@ -615,6 +615,9 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
 
             if run_llm:
                 await self._user_context_aggregator.push_context_frame()
+
+            frame = OpenAILLMContextFrame(self._context)
+            await self.push_frame(frame)
 
         except Exception as e:
             logger.error(f"Error processing frame: {e}")

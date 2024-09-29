@@ -7,37 +7,36 @@
 import json
 import re
 import uuid
-from pydantic import BaseModel, Field
-
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
 from asyncio import CancelledError
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
+from pydantic import BaseModel, Field
 
 from pipecat.frames.frames import (
     Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
     LLMModelUpdateFrame,
+    StartInterruptionFrame,
     TextFrame,
     UserImageRequestFrame,
-    LLMMessagesFrame,
-    LLMFullResponseStartFrame,
-    LLMFullResponseEndFrame,
-    FunctionCallResultFrame,
-    FunctionCallInProgressFrame,
-    StartInterruptionFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ai_services import LLMService
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantContextAggregator,
+    LLMUserContextAggregator,
+)
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
-from pipecat.processors.aggregators.llm_response import (
-    LLMUserContextAggregator,
-    LLMAssistantContextAggregator,
-)
-
-from loguru import logger
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.ai_services import LLMService
 
 try:
     from together import AsyncTogether
@@ -188,7 +187,7 @@ class TogetherLLMService(LLMService):
                 if chunk.choices[0].finish_reason == "eos" and accumulating_function_call:
                     await self._extract_function_call(context, function_call_accumulator)
 
-        except CancelledError as e:
+        except CancelledError:
             # todo: implement token counting estimates for use when the user interrupts a long generation
             # we do this in the anthropic.py service
             raise
@@ -338,7 +337,7 @@ class TogetherAssistantContextAggregator(LLMAssistantContextAggregator):
                 await self._push_aggregation()
             else:
                 logger.warning(
-                    f"FunctionCallResultFrame tool_call_id does not match FunctionCallInProgressFrame tool_call_id"
+                    "FunctionCallResultFrame tool_call_id does not match FunctionCallInProgressFrame tool_call_id"
                 )
                 self._function_call_in_progress = None
                 self._function_call_result = None
@@ -353,7 +352,7 @@ class TogetherAssistantContextAggregator(LLMAssistantContextAggregator):
         run_llm = False
 
         aggregation = self._aggregation
-        self._aggregation = ""
+        self._reset()
 
         try:
             if self._function_call_result:
@@ -372,6 +371,9 @@ class TogetherAssistantContextAggregator(LLMAssistantContextAggregator):
 
             if run_llm:
                 await self._user_context_aggregator.push_messages_frame()
+
+            frame = OpenAILLMContextFrame(self._context)
+            await self.push_frame(frame)
 
         except Exception as e:
             logger.error(f"Error processing frame: {e}")
