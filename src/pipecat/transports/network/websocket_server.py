@@ -7,8 +7,9 @@
 import asyncio
 import io
 import wave
+import ssl
 
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 from pydantic.main import BaseModel
 
 from pipecat.frames.frames import (
@@ -38,6 +39,8 @@ class WebsocketServerParams(TransportParams):
     add_wav_header: bool = False
     audio_frame_size: int = 6400  # 200ms
     serializer: FrameSerializer = ProtobufFrameSerializer()
+    ssl_cert_path: Optional[str] = None
+    ssl_key_path: Optional[str] = None
 
 
 class WebsocketServerCallbacks(BaseModel):
@@ -64,6 +67,18 @@ class WebsocketServerInputTransport(BaseInputTransport):
         self._websocket: websockets.WebSocketServerProtocol | None = None
 
         self._stop_server_event = asyncio.Event()
+    async def _server_task_handler(self):
+       ssl_context = None
+       protocol = "ws"
+
+       if self._params.ssl_cert_path and self._params.ssl_key_path:
+          ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ssl_context.load_cert_chain(self._params.ssl_cert_path, self._params.ssl_key_path)
+          protocol = "wss"
+
+       logger.info(f"Starting {protocol} server on {self._host}:{self._port}")
+       async with websockets.serve(self._client_handler, self._host, self._port, ssl=ssl_context) as server:
+            await self._stop_server_event.wait()
 
     async def start(self, frame: StartFrame):
         self._server_task = self.get_event_loop().create_task(self._server_task_handler())
@@ -79,10 +94,6 @@ class WebsocketServerInputTransport(BaseInputTransport):
         self._stop_server_event.set()
         await self._server_task
 
-    async def _server_task_handler(self):
-        logger.info(f"Starting websocket server on {self._host}:{self._port}")
-        async with websockets.serve(self._client_handler, self._host, self._port) as server:
-            await self._stop_server_event.wait()
 
     async def _client_handler(self, websocket: websockets.WebSocketServerProtocol, path):
         logger.info(f"New client connection from {websocket.remote_address}")
