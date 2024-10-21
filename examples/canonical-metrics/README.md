@@ -14,8 +14,6 @@ This project implements a chatbot using a pipeline architecture that integrates 
 ## Requirements
 
 - Python 3.7+
-- `aiohttp`
-- `loguru`
 - `python-dotenv`
 - Additional libraries from the `pipecat` package.
 
