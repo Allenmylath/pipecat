@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -71,15 +71,16 @@ class Pipeline(BasePipeline):
     #
 
     async def cleanup(self):
+        await super().cleanup()
         await self._cleanup_processors()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if direction == FrameDirection.DOWNSTREAM:
-            await self._source.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await self._source.queue_frame(frame, FrameDirection.DOWNSTREAM)
         elif direction == FrameDirection.UPSTREAM:
-            await self._sink.process_frame(frame, FrameDirection.UPSTREAM)
+            await self._sink.queue_frame(frame, FrameDirection.UPSTREAM)
 
     async def _cleanup_processors(self):
         for p in self._processors:

@@ -1,33 +1,29 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import aiohttp
 import argparse
-import subprocess
 import os
-
+import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request, HTTPException
+import aiohttp
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from pipecat.transports.services.helpers.daily_rest import (
     DailyRESTHelper,
     DailyRoomObject,
-    DailyRoomProperties,
     DailyRoomParams,
+    DailyRoomProperties,
 )
-
-
-from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
@@ -69,7 +65,7 @@ STATIC_DIR = "frontend/out"
 app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
-@app.post("/start_bot")
+@app.post("/")
 async def start_bot(request: Request) -> JSONResponse:
     if os.getenv("ENV", "dev") == "production":
         # Only allow requests from the specified domain
@@ -118,7 +114,7 @@ async def start_bot(request: Request) -> JSONResponse:
     else:
         try:
             subprocess.Popen(
-                [f"python3 -m bot -u {room.url} -t {token}"],
+                [f"python -m bot -u {room.url} -t {token}"],
                 shell=True,
                 bufsize=1,
                 cwd=os.path.dirname(os.path.abspath(__file__)),
@@ -158,8 +154,7 @@ async def catch_all(path_name: Optional[str] = ""):
 
 
 async def virtualize_bot(room_url: str, token: str):
-    """
-    This is an example of how to virtualize the bot using Fly.io
+    """This is an example of how to virtualize the bot using Fly.io
     You can adapt this method to use whichever cloud provider you prefer.
     """
     FLY_API_HOST = os.getenv("FLY_API_HOST", "https://api.machines.dev/v1")
@@ -180,7 +175,7 @@ async def virtualize_bot(room_url: str, token: str):
             image = data[0]["config"]["image"]
 
         # Machine configuration
-        cmd = f"python3 src/bot.py -u {room_url} -t {token}"
+        cmd = f"python src/bot.py -u {room_url} -t {token}"
         cmd = cmd.split()
         worker_props = {
             "config": {
@@ -220,9 +215,8 @@ async def virtualize_bot(room_url: str, token: str):
 if __name__ == "__main__":
     # Check environment variables
     required_env_vars = [
-        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
         "DAILY_API_KEY",
-        "FAL_KEY",
         "ELEVENLABS_VOICE_ID",
         "ELEVENLABS_API_KEY",
     ]

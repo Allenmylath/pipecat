@@ -1,14 +1,13 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 import asyncio
-
 from typing import Awaitable, Callable, List
 
-from pipecat.frames.frames import Frame
+from pipecat.frames.frames import Frame, StartFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
@@ -32,10 +31,11 @@ class IdleFrameProcessor(FrameProcessor):
         self._timeout = timeout
         self._types = types
 
-        self._create_idle_task()
-
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartFrame):
+            self._create_idle_task()
 
         await self.push_frame(frame, direction)
 
@@ -49,12 +49,11 @@ class IdleFrameProcessor(FrameProcessor):
                     self._idle_event.set()
 
     async def cleanup(self):
-        self._idle_task.cancel()
-        await self._idle_task
+        await self.cancel_task(self._idle_task)
 
     def _create_idle_task(self):
         self._idle_event = asyncio.Event()
-        self._idle_task = self.get_event_loop().create_task(self._idle_task_handler())
+        self._idle_task = self.create_task(self._idle_task_handler())
 
     async def _idle_task_handler(self):
         while True:
@@ -62,7 +61,5 @@ class IdleFrameProcessor(FrameProcessor):
                 await asyncio.wait_for(self._idle_event.wait(), timeout=self._timeout)
             except asyncio.TimeoutError:
                 await self._callback(self)
-            except asyncio.CancelledError:
-                break
             finally:
                 self._idle_event.clear()

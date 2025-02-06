@@ -1,29 +1,27 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 import asyncio
-import aiohttp
 import os
 import sys
 
+import aiohttp
+from dotenv import load_dotenv
+from loguru import logger
+from openai.types.chat import ChatCompletionToolParam
+from runner import configure
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.openai import OpenAILLMContext, OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
-from pipecat.vad.silero import SileroVADAnalyzer
-
-from openai.types.chat import ChatCompletionToolParam
-
-from runner import configure
-
-from loguru import logger
-
-from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
@@ -32,11 +30,8 @@ logger.add(sys.stderr, level="DEBUG")
 
 
 async def start_fetch_weather(function_name, llm, context):
-    # note: we can't push a frame to the LLM here. the bot
-    # can interrupt itself and/or cause audio overlapping glitches.
-    # possible question for Aleix and Chad about what the right way
-    # to trigger speech is, now, with the new queues/async/sync refactors.
-    # await llm.push_frame(TextFrame("Let me check on that."))
+    """Push a frame to the LLM; this is handy when the LLM response might take a while."""
+    await llm.push_frame(TTSSpeakFrame("Let me check on that."))
     logger.debug(f"Starting fetch_weather_from_api with function_name: {function_name}")
 
 
@@ -115,13 +110,21 @@ async def main():
             ]
         )
 
-        task = PipelineTask(pipeline)
+        task = PipelineTask(
+            pipeline,
+            PipelineParams(
+                allow_interruptions=True,
+                enable_metrics=True,
+                enable_usage_metrics=True,
+                report_only_initial_ttfb=True,
+            ),
+        )
 
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant):
-            transport.capture_participant_transcription(participant["id"])
+            await transport.capture_participant_transcription(participant["id"])
             # Kick off the conversation.
-            await tts.say("Hi! Ask me about the weather in San Francisco.")
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
 
         runner = PipelineRunner()
 

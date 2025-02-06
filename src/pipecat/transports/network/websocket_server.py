@@ -1,30 +1,32 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 import asyncio
 import io
+import time
 import wave
-
 from typing import Awaitable, Callable
-from pydantic.main import BaseModel
+
+from loguru import logger
+from pydantic import BaseModel
 
 from pipecat.frames.frames import (
-    AudioRawFrame,
     CancelFrame,
     EndFrame,
+    Frame,
     InputAudioRawFrame,
+    OutputAudioRawFrame,
     StartFrame,
+    StartInterruptionFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.serializers.base_serializer import FrameSerializer
-from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-
-from loguru import logger
 
 try:
     import websockets
@@ -36,13 +38,14 @@ except ModuleNotFoundError as e:
 
 class WebsocketServerParams(TransportParams):
     add_wav_header: bool = False
-    audio_frame_size: int = 6400  # 200ms
-    serializer: FrameSerializer = ProtobufFrameSerializer()
+    serializer: FrameSerializer
+    session_timeout: int | None = None
 
 
 class WebsocketServerCallbacks(BaseModel):
     on_client_connected: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
     on_client_disconnected: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
+    on_session_timeout: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
 
 
 class WebsocketServerInputTransport(BaseInputTransport):
@@ -63,21 +66,32 @@ class WebsocketServerInputTransport(BaseInputTransport):
 
         self._websocket: websockets.WebSocketServerProtocol | None = None
 
+        self._server_task = None
+
+        # This task will monitor the websocket connection periodically.
+        self._monitor_task = None
+
         self._stop_server_event = asyncio.Event()
 
     async def start(self, frame: StartFrame):
-        self._server_task = self.get_event_loop().create_task(self._server_task_handler())
         await super().start(frame)
+        await self._params.serializer.setup(frame)
+        self._server_task = self.create_task(self._server_task_handler())
 
     async def stop(self, frame: EndFrame):
         await super().stop(frame)
         self._stop_server_event.set()
-        await self._server_task
+        if self._monitor_task:
+            await self.cancel_task(self._monitor_task)
+        if self._server_task:
+            await self.wait_for_task(self._server_task)
 
     async def cancel(self, frame: CancelFrame):
         await super().cancel(frame)
-        self._stop_server_event.set()
-        await self._server_task
+        if self._monitor_task:
+            await self.cancel_task(self._monitor_task)
+        if self._server_task:
+            await self.cancel_task(self._server_task)
 
     async def _server_task_handler(self):
         logger.info(f"Starting websocket server on {self._host}:{self._port}")
@@ -95,23 +109,26 @@ class WebsocketServerInputTransport(BaseInputTransport):
         # Notify
         await self._callbacks.on_client_connected(websocket)
 
+        # Create a task to monitor the websocket connection
+        if self._params.session_timeout:
+            self._monitor_task = self.create_task(
+                self._monitor_websocket(websocket, self._params.session_timeout)
+            )
+
         # Handle incoming messages
-        async for message in websocket:
-            frame = self._params.serializer.deserialize(message)
+        try:
+            async for message in websocket:
+                frame = await self._params.serializer.deserialize(message)
 
-            if not frame:
-                continue
+                if not frame:
+                    continue
 
-            if isinstance(frame, AudioRawFrame):
-                await self.push_audio_frame(
-                    InputAudioRawFrame(
-                        audio=frame.audio,
-                        sample_rate=frame.sample_rate,
-                        num_channels=frame.num_channels,
-                    )
-                )
-            else:
-                await self.push_frame(frame)
+                if isinstance(frame, InputAudioRawFrame):
+                    await self.push_audio_frame(frame)
+                else:
+                    await self.push_frame(frame)
+        except Exception as e:
+            logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
 
         # Notify disconnection
         await self._callbacks.on_client_disconnected(websocket)
@@ -120,6 +137,19 @@ class WebsocketServerInputTransport(BaseInputTransport):
         self._websocket = None
 
         logger.info(f"Client {websocket.remote_address} disconnected")
+
+    async def _monitor_websocket(
+        self, websocket: websockets.WebSocketServerProtocol, session_timeout: int
+    ):
+        """Wait for session_timeout seconds, if the websocket is still open,
+        trigger timeout event."""
+        try:
+            await asyncio.sleep(session_timeout)
+            if not websocket.closed:
+                await self._callbacks.on_session_timeout(websocket)
+        except asyncio.CancelledError:
+            logger.info(f"Monitoring task cancelled for: {websocket.remote_address}")
+            raise
 
 
 class WebsocketServerOutputTransport(BaseOutputTransport):
@@ -130,7 +160,13 @@ class WebsocketServerOutputTransport(BaseOutputTransport):
 
         self._websocket: websockets.WebSocketServerProtocol | None = None
 
-        self._websocket_audio_buffer = bytes()
+        # write_raw_audio_frames() is called quickly, as soon as we get audio
+        # (e.g. from the TTS), and since this is just a network connection we
+        # would be sending it to quickly. Instead, we want to block to emulate
+        # an audio device, this is what the send interval is. It will be
+        # computed on StartFrame.
+        self._send_interval = 0
+        self._next_send_time = 0
 
     async def set_client_connection(self, websocket: websockets.WebSocketServerProtocol | None):
         if self._websocket:
@@ -138,52 +174,78 @@ class WebsocketServerOutputTransport(BaseOutputTransport):
             logger.warning("Only one client allowed, using new connection")
         self._websocket = websocket
 
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        await self._params.serializer.setup(frame)
+        self._send_interval = (self._audio_chunk_size / self.sample_rate) / 2
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartInterruptionFrame):
+            await self._write_frame(frame)
+            self._next_send_time = 0
+
     async def write_raw_audio_frames(self, frames: bytes):
         if not self._websocket:
+            # Simulate audio playback with a sleep.
+            await self._write_audio_sleep()
             return
 
-        self._websocket_audio_buffer += frames
-        while len(self._websocket_audio_buffer) >= self._params.audio_frame_size:
-            frame = AudioRawFrame(
-                audio=self._websocket_audio_buffer[: self._params.audio_frame_size],
-                sample_rate=self._params.audio_out_sample_rate,
-                num_channels=self._params.audio_out_channels,
-            )
+        frame = OutputAudioRawFrame(
+            audio=frames,
+            sample_rate=self.sample_rate,
+            num_channels=self._params.audio_out_channels,
+        )
 
-            if self._params.add_wav_header:
-                content = io.BytesIO()
-                ww = wave.open(content, "wb")
-                ww.setsampwidth(2)
-                ww.setnchannels(frame.num_channels)
-                ww.setframerate(frame.sample_rate)
-                ww.writeframes(frame.audio)
-                ww.close()
-                content.seek(0)
-                wav_frame = AudioRawFrame(
-                    content.read(), sample_rate=frame.sample_rate, num_channels=frame.num_channels
+        if self._params.add_wav_header:
+            with io.BytesIO() as buffer:
+                with wave.open(buffer, "wb") as wf:
+                    wf.setsampwidth(2)
+                    wf.setnchannels(frame.num_channels)
+                    wf.setframerate(frame.sample_rate)
+                    wf.writeframes(frame.audio)
+                wav_frame = OutputAudioRawFrame(
+                    buffer.getvalue(),
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
                 )
                 frame = wav_frame
 
-            proto = self._params.serializer.serialize(frame)
-            if proto:
-                await self._websocket.send(proto)
+        await self._write_frame(frame)
 
-            self._websocket_audio_buffer = self._websocket_audio_buffer[
-                self._params.audio_frame_size :
-            ]
+        # Simulate audio playback with a sleep.
+        await self._write_audio_sleep()
+
+    async def _write_frame(self, frame: Frame):
+        try:
+            payload = await self._params.serializer.serialize(frame)
+            if payload and self._websocket:
+                await self._websocket.send(payload)
+        except Exception as e:
+            logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
+
+    async def _write_audio_sleep(self):
+        # Simulate a clock.
+        current_time = time.monotonic()
+        sleep_duration = max(0, self._next_send_time - current_time)
+        await asyncio.sleep(sleep_duration)
+        if sleep_duration == 0:
+            self._next_send_time = time.monotonic() + self._send_interval
+        else:
+            self._next_send_time += self._send_interval
 
 
 class WebsocketServerTransport(BaseTransport):
     def __init__(
         self,
+        params: WebsocketServerParams,
         host: str = "localhost",
         port: int = 8765,
-        params: WebsocketServerParams = WebsocketServerParams(),
         input_name: str | None = None,
         output_name: str | None = None,
-        loop: asyncio.AbstractEventLoop | None = None,
     ):
-        super().__init__(input_name=input_name, output_name=output_name, loop=loop)
+        super().__init__(input_name=input_name, output_name=output_name)
         self._host = host
         self._port = port
         self._params = params
@@ -191,6 +253,7 @@ class WebsocketServerTransport(BaseTransport):
         self._callbacks = WebsocketServerCallbacks(
             on_client_connected=self._on_client_connected,
             on_client_disconnected=self._on_client_disconnected,
+            on_session_timeout=self._on_session_timeout,
         )
         self._input: WebsocketServerInputTransport | None = None
         self._output: WebsocketServerOutputTransport | None = None
@@ -200,6 +263,7 @@ class WebsocketServerTransport(BaseTransport):
         # these handlers.
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")
+        self._register_event_handler("on_session_timeout")
 
     def input(self) -> WebsocketServerInputTransport:
         if not self._input:
@@ -226,3 +290,6 @@ class WebsocketServerTransport(BaseTransport):
             await self._call_event_handler("on_client_disconnected", websocket)
         else:
             logger.error("A WebsocketServerTransport output is missing in the pipeline")
+
+    async def _on_session_timeout(self, websocket):
+        await self._call_event_handler("on_session_timeout", websocket)

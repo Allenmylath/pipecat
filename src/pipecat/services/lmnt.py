@@ -1,11 +1,11 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
-from typing import AsyncGenerator
+import json
+from typing import AsyncGenerator, Optional
 
 from loguru import logger
 
@@ -22,11 +22,12 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_services import TTSService
+from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
 
 # See .env.example for LMNT configuration needed
 try:
-    from lmnt.api import Speech
+    import websockets
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -35,66 +36,61 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
-class LmntTTSService(TTSService):
+def language_to_lmnt_language(language: Language) -> str | None:
+    BASE_LANGUAGES = {
+        Language.DE: "de",
+        Language.EN: "en",
+        Language.ES: "es",
+        Language.FR: "fr",
+        Language.KO: "ko",
+        Language.PT: "pt",
+        Language.ZH: "zh",
+    }
+
+    result = BASE_LANGUAGES.get(language)
+
+    # If not found in base languages, try to find the base language from a variant
+    if not result:
+        # Convert enum value to string and get the base language part (e.g. es-ES -> es)
+        lang_str = str(language.value)
+        base_code = lang_str.split("-")[0].lower()
+        # Look up the base code in our supported languages
+        result = base_code if base_code in BASE_LANGUAGES.values() else None
+
+    return result
+
+
+class LmntTTSService(TTSService, WebsocketService):
     def __init__(
         self,
         *,
         api_key: str,
         voice_id: str,
-        sample_rate: int = 24000,
+        sample_rate: Optional[int] = None,
         language: Language = Language.EN,
         **kwargs,
     ):
-        # Let TTSService produce TTSStoppedFrames after a short delay of
-        # no activity.
-        super().__init__(push_stop_frames=True, sample_rate=sample_rate, **kwargs)
+        TTSService.__init__(
+            self,
+            push_stop_frames=True,
+            sample_rate=sample_rate,
+            **kwargs,
+        )
+        WebsocketService.__init__(self)
 
         self._api_key = api_key
+        self._voice_id = voice_id
         self._settings = {
-            "output_format": {
-                "container": "raw",
-                "encoding": "pcm_s16le",
-                "sample_rate": sample_rate,
-            },
             "language": self.language_to_service_language(language),
+            "format": "raw",  # Use raw format for direct PCM data
         }
-
-        self.set_voice(voice_id)
-
-        self._speech = None
-        self._connection = None
-        self._receive_task = None
-        # Indicates if we have sent TTSStartedFrame. It will reset to False when
-        # there's an interruption or TTSStoppedFrame.
         self._started = False
 
     def can_generate_metrics(self) -> bool:
         return True
 
     def language_to_service_language(self, language: Language) -> str | None:
-        match language:
-            case Language.DE:
-                return "de"
-            case (
-                Language.EN
-                | Language.EN_US
-                | Language.EN_AU
-                | Language.EN_GB
-                | Language.EN_NZ
-                | Language.EN_IN
-            ):
-                return "en"
-            case Language.ES:
-                return "es"
-            case Language.FR | Language.FR_CA:
-                return "fr"
-            case Language.PT | Language.PT_BR:
-                return "pt"
-            case Language.ZH | Language.ZH_TW:
-                return "zh"
-            case Language.KO:
-                return "ko"
-        return None
+        return language_to_lmnt_language(language)
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -114,75 +110,104 @@ class LmntTTSService(TTSService):
             self._started = False
 
     async def _connect(self):
-        try:
-            self._speech = Speech()
-            self._connection = await self._speech.synthesize_streaming(
-                self._voice_id,
-                format="raw",
-                sample_rate=self._settings["output_format"]["sample_rate"],
-                language=self._settings["language"],
-            )
-            self._receive_task = self.get_event_loop().create_task(self._receive_task_handler())
-        except Exception as e:
-            logger.exception(f"{self} initialization error: {e}")
-            self._connection = None
+        await self._connect_websocket()
+
+        self._receive_task = self.create_task(self._receive_task_handler(self.push_error))
 
     async def _disconnect(self):
+        await self._disconnect_websocket()
+
+        if self._receive_task:
+            await self.cancel_task(self._receive_task)
+            self._receive_task = None
+
+    async def _connect_websocket(self):
+        """Connect to LMNT websocket."""
+        try:
+            logger.debug("Connecting to LMNT")
+
+            # Build initial connection message
+            init_msg = {
+                "X-API-Key": self._api_key,
+                "voice": self._voice_id,
+                "format": self._settings["format"],
+                "sample_rate": self.sample_rate,
+                "language": self._settings["language"],
+            }
+
+            # Connect to LMNT's websocket directly
+            self._websocket = await websockets.connect("wss://api.lmnt.com/v1/ai/speech/stream")
+
+            # Send initialization message
+            await self._websocket.send(json.dumps(init_msg))
+
+        except Exception as e:
+            logger.error(f"{self} initialization error: {e}")
+            self._websocket = None
+
+    async def _disconnect_websocket(self):
+        """Disconnect from LMNT websocket."""
         try:
             await self.stop_all_metrics()
 
-            if self._receive_task:
-                self._receive_task.cancel()
-                await self._receive_task
-                self._receive_task = None
-            if self._connection:
-                await self._connection.socket.close()
-                self._connection = None
-            if self._speech:
-                await self._speech.close()
-                self._speech = None
+            if self._websocket:
+                logger.debug("Disconnecting from LMNT")
+                # Send EOF message before closing
+                await self._websocket.send(json.dumps({"eof": True}))
+                await self._websocket.close()
+                self._websocket = None
+
             self._started = False
         except Exception as e:
-            logger.exception(f"{self} error closing websocket: {e}")
+            logger.error(f"{self} error closing websocket: {e}")
 
-    async def _receive_task_handler(self):
-        try:
-            async for msg in self._connection:
-                if "error" in msg:
-                    logger.error(f'{self} error: {msg["error"]}')
-                    await self.push_frame(TTSStoppedFrame())
-                    await self.stop_all_metrics()
-                    await self.push_error(ErrorFrame(f'{self} error: {msg["error"]}'))
-                elif "audio" in msg:
-                    await self.stop_ttfb_metrics()
-                    frame = TTSAudioRawFrame(
-                        audio=msg["audio"],
-                        sample_rate=self._settings["output_format"]["sample_rate"],
-                        num_channels=1,
-                    )
-                    await self.push_frame(frame)
-                else:
-                    logger.error(f"LMNT error, unknown message type: {msg}")
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception(f"{self} exception: {e}")
+    def _get_websocket(self):
+        if self._websocket:
+            return self._websocket
+        raise Exception("Websocket not connected")
+
+    async def _receive_messages(self):
+        """Receive messages from LMNT websocket."""
+        async for message in self._get_websocket():
+            if isinstance(message, bytes):
+                # Raw audio data
+                await self.stop_ttfb_metrics()
+                frame = TTSAudioRawFrame(
+                    audio=message,
+                    sample_rate=self.sample_rate,
+                    num_channels=1,
+                )
+                await self.push_frame(frame)
+            else:
+                try:
+                    msg = json.loads(message)
+                    if "error" in msg:
+                        logger.error(f"{self} error: {msg['error']}")
+                        await self.push_frame(TTSStoppedFrame())
+                        await self.stop_all_metrics()
+                        await self.push_error(ErrorFrame(f"{self} error: {msg['error']}"))
+                        return
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON message: {message}")
 
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+        """Generate TTS audio from text."""
         logger.debug(f"Generating TTS: [{text}]")
 
         try:
-            if not self._connection:
+            if not self._websocket:
                 await self._connect()
 
-            if not self._started:
-                await self.start_ttfb_metrics()
-                yield TTSStartedFrame()
-                self._started = True
-
             try:
-                await self._connection.append_text(text)
-                await self._connection.flush()
+                if not self._started:
+                    await self.start_ttfb_metrics()
+                    yield TTSStartedFrame()
+                    self._started = True
+
+                # Send text to LMNT
+                await self._get_websocket().send(json.dumps({"text": text}))
+                # Force synthesis
+                await self._get_websocket().send(json.dumps({"flush": True}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
                 logger.error(f"{self} error sending message: {e}")
@@ -192,4 +217,4 @@ class LmntTTSService(TTSService):
                 return
             yield None
         except Exception as e:
-            logger.exception(f"{self} exception: {e}")
+            logger.error(f"{self} exception: {e}")

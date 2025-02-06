@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -7,10 +7,10 @@
 import ctypes
 import pickle
 
-from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
-from pipecat.serializers.base_serializer import FrameSerializer
-
 from loguru import logger
+
+from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
+from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
 
 try:
     from livekit.rtc import AudioFrame
@@ -21,7 +21,11 @@ except ModuleNotFoundError as e:
 
 
 class LivekitFrameSerializer(FrameSerializer):
-    def serialize(self, frame: Frame) -> str | bytes | None:
+    @property
+    def type(self) -> FrameSerializerType:
+        return FrameSerializerType.BINARY
+
+    async def serialize(self, frame: Frame) -> str | bytes | None:
         if not isinstance(frame, OutputAudioRawFrame):
             return None
         audio_frame = AudioFrame(
@@ -32,7 +36,7 @@ class LivekitFrameSerializer(FrameSerializer):
         )
         return pickle.dumps(audio_frame)
 
-    def deserialize(self, data: str | bytes) -> Frame | None:
+    async def deserialize(self, data: str | bytes) -> Frame | None:
         audio_frame: AudioFrame = pickle.loads(data)["frame"]
         return InputAudioRawFrame(
             audio=bytes(audio_frame.data),
