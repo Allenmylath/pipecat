@@ -225,7 +225,9 @@ class GladiaSTTService(STTService):
 
     async def _receive_task_handler(self):
         async for message in self._websocket:
+            logger.debug(f"Received websocket message: {message}")
             content = json.loads(message)
+            logger.info(f"Parsed message content: {content}")
             if content["type"] == "transcript":
                 utterance = content["data"]["utterance"]
                 confidence = utterance.get("confidence", 0)
