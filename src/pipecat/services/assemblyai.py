@@ -46,7 +46,7 @@ class AssemblyAISTTService(STTService):
         super().__init__(sample_rate=sample_rate, **kwargs)
 
         aai.settings.api_key = api_key
-        self._transcriber: aai.RealtimeTranscriber | None = None
+        self._transcriber: Optional[aai.RealtimeTranscriber] = None
 
         self._settings = {
             "encoding": encoding,
@@ -90,6 +90,9 @@ class AssemblyAISTTService(STTService):
         This method sets up the necessary callback functions and initializes the
         AssemblyAI transcriber.
         """
+
+        if self._transcriber:
+            return
 
         def on_open(session_opened: aai.RealtimeSessionOpened):
             """Callback for when the connection to AssemblyAI is opened."""

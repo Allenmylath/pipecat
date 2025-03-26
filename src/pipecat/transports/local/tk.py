@@ -7,6 +7,7 @@
 import asyncio
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import numpy as np
 from loguru import logger
@@ -33,8 +34,15 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
+class TkTransportParams(TransportParams):
+    audio_input_device_index: Optional[int] = None
+    audio_output_device_index: Optional[int] = None
+
+
 class TkInputTransport(BaseInputTransport):
-    def __init__(self, py_audio: pyaudio.PyAudio, params: TransportParams):
+    _params: TkTransportParams
+
+    def __init__(self, py_audio: pyaudio.PyAudio, params: TkTransportParams):
         super().__init__(params)
         self._py_audio = py_audio
         self._in_stream = None
@@ -42,6 +50,9 @@ class TkInputTransport(BaseInputTransport):
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
+
+        if self._in_stream:
+            return
 
         self._sample_rate = self._params.audio_in_sample_rate or frame.audio_in_sample_rate
         num_frames = int(self._sample_rate / 100) * 2  # 20ms of audio
@@ -53,6 +64,7 @@ class TkInputTransport(BaseInputTransport):
             frames_per_buffer=num_frames,
             stream_callback=self._audio_in_callback,
             input=True,
+            input_device_index=self._params.audio_input_device_index,
         )
         self._in_stream.start_stream()
 
@@ -60,10 +72,8 @@ class TkInputTransport(BaseInputTransport):
         await super().cleanup()
         if self._in_stream:
             self._in_stream.stop_stream()
-            # This is not very pretty (taken from PyAudio docs).
-            while self._in_stream.is_active():
-                await asyncio.sleep(0.1)
             self._in_stream.close()
+            self._in_stream = None
 
     def _audio_in_callback(self, in_data, frame_count, time_info, status):
         frame = InputAudioRawFrame(
@@ -78,7 +88,9 @@ class TkInputTransport(BaseInputTransport):
 
 
 class TkOutputTransport(BaseOutputTransport):
-    def __init__(self, tk_root: tk.Tk, py_audio: pyaudio.PyAudio, params: TransportParams):
+    _params: TkTransportParams
+
+    def __init__(self, tk_root: tk.Tk, py_audio: pyaudio.PyAudio, params: TkTransportParams):
         super().__init__(params)
         self._py_audio = py_audio
         self._out_stream = None
@@ -98,6 +110,9 @@ class TkOutputTransport(BaseOutputTransport):
     async def start(self, frame: StartFrame):
         await super().start(frame)
 
+        if self._out_stream:
+            return
+
         self._sample_rate = self._params.audio_out_sample_rate or frame.audio_out_sample_rate
 
         self._out_stream = self._py_audio.open(
@@ -105,6 +120,7 @@ class TkOutputTransport(BaseOutputTransport):
             channels=self._params.audio_out_channels,
             rate=self._sample_rate,
             output=True,
+            output_device_index=self._params.audio_output_device_index,
         )
         self._out_stream.start_stream()
 
@@ -112,10 +128,8 @@ class TkOutputTransport(BaseOutputTransport):
         await super().cleanup()
         if self._out_stream:
             self._out_stream.stop_stream()
-            # This is not very pretty (taken from PyAudio docs).
-            while self._out_stream.is_active():
-                await asyncio.sleep(0.1)
             self._out_stream.close()
+            self._out_stream = None
 
     async def write_raw_audio_frames(self, frames: bytes):
         if self._out_stream:
@@ -139,14 +153,14 @@ class TkOutputTransport(BaseOutputTransport):
 
 
 class TkLocalTransport(BaseTransport):
-    def __init__(self, tk_root: tk.Tk, params: TransportParams):
+    def __init__(self, tk_root: tk.Tk, params: TkTransportParams):
         super().__init__()
         self._tk_root = tk_root
         self._params = params
         self._pyaudio = pyaudio.PyAudio()
 
-        self._input: TkInputTransport | None = None
-        self._output: TkOutputTransport | None = None
+        self._input: Optional[TkInputTransport] = None
+        self._output: Optional[TkOutputTransport] = None
 
     #
     # BaseTransport

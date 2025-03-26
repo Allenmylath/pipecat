@@ -74,7 +74,7 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
 
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
+        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
         push_silence_after_stop=testing,
     )
 
@@ -90,7 +90,7 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
 
     # NOTE: Watch out! This will save all the conversation in memory. You can
     # pass `buffer_size` to get periodic callbacks.
-    audiobuffer = AudioBufferProcessor()
+    audiobuffer = AudioBufferProcessor(user_continuous_stream=not testing)
 
     pipeline = Pipeline(
         [
@@ -108,7 +108,9 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=8000, audio_out_sample_rate=8000, allow_interruptions=True
+            audio_in_sample_rate=8000,
+            audio_out_sample_rate=8000,
+            allow_interruptions=True,
         ),
     )
 

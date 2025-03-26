@@ -32,7 +32,7 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
-def language_to_aws_language(language: Language) -> str | None:
+def language_to_aws_language(language: Language) -> Optional[str]:
     language_map = {
         # Arabic
         Language.AR: "arb",
@@ -154,7 +154,7 @@ class PollyTTSService(TTSService):
     def can_generate_metrics(self) -> bool:
         return True
 
-    def language_to_service_language(self, language: Language) -> str | None:
+    def language_to_service_language(self, language: Language) -> Optional[str]:
         return language_to_aws_language(language)
 
     def _construct_ssml(self, text: str) -> str:
@@ -197,7 +197,7 @@ class PollyTTSService(TTSService):
                 return audio_data
             return None
 
-        logger.debug(f"Generating TTS: [{text}]")
+        logger.debug(f"{self}: Generating TTS [{text}]")
 
         try:
             await self.start_ttfb_metrics()
@@ -248,16 +248,3 @@ class PollyTTSService(TTSService):
 
         finally:
             yield TTSStoppedFrame()
-
-
-class AWSTTSService(PollyTTSService):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("always")
-            warnings.warn(
-                "'AWSTTSService' is deprecated, use 'PollyTTSService' instead.", DeprecationWarning
-            )
