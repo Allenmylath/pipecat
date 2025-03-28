@@ -605,14 +605,14 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
                 frame.function_name, frame.tool_call_id, frame.result
             )
         else:
-            response = {"response": "COMPLETED"}
             await self._update_function_call_result(
-                frame.function_name, frame.tool_call_id, response
+                frame.function_name, frame.tool_call_id, "COMPLETED"
             )
 
     async def handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
-        response = {"response": "CANCELLED"}
-        await self._update_function_call_result(frame.function_name, frame.tool_call_id, response)
+        await self._update_function_call_result(
+            frame.function_name, frame.tool_call_id, "CANCELLED"
+        )
 
     async def _update_function_call_result(
         self, function_name: str, tool_call_id: str, result: Any
@@ -621,12 +621,11 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
             if message.role == "user":
                 for part in message.parts:
                     if part.function_response and part.function_response.id == tool_call_id:
-                        part.function_response.response = result
+                        part.function_response.response = {"value": json.dumps(result)}
 
     async def handle_user_image_frame(self, frame: UserImageRawFrame):
-        response = {"response": "COMPLETED"}
         await self._update_function_call_result(
-            frame.request.function_name, frame.request.tool_call_id, response
+            frame.request.function_name, frame.request.tool_call_id, "COMPLETED"
         )
         self._context.add_image_frame_message(
             format=frame.format,
@@ -1344,6 +1343,7 @@ class GoogleVertexLLMService(OpenAILLMService):
         **kwargs,
     ):
         """Initializes the VertexLLMService.
+
         Args:
             credentials (Optional[str]): JSON string of service account credentials.
             credentials_path (Optional[str]): Path to the service account JSON file.
@@ -1367,9 +1367,11 @@ class GoogleVertexLLMService(OpenAILLMService):
     @staticmethod
     def _get_api_token(credentials: Optional[str], credentials_path: Optional[str]) -> str:
         """Retrieves an authentication token using Google service account credentials.
+
         Args:
             credentials (Optional[str]): JSON string of service account credentials.
             credentials_path (Optional[str]): Path to the service account JSON file.
+
         Returns:
             str: OAuth token for API authentication.
         """
@@ -1558,8 +1560,6 @@ class GoogleTTSService(TTSService):
             logger.exception(f"{self} error generating TTS: {e}")
             error_message = f"TTS generation error: {str(e)}"
             yield ErrorFrame(error=error_message)
-        finally:
-            yield TTSStoppedFrame()
 
 
 class GoogleImageGenService(ImageGenService):

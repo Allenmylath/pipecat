@@ -364,6 +364,13 @@ class LLMSetToolsFrame(DataFrame):
 
 
 @dataclass
+class LLMSetToolChoiceFrame(DataFrame):
+    """A frame containing a tool choice for an LLM to use for function calling."""
+
+    tool_choice: Literal["none", "auto", "required"] | dict
+
+
+@dataclass
 class LLMEnablePromptCachingFrame(DataFrame):
     """A frame to enable/disable prompt caching in certain LLMs."""
 
@@ -555,14 +562,14 @@ class UserStartedSpeakingFrame(SystemFrame):
 
     """
 
-    pass
+    emulated: bool = False
 
 
 @dataclass
 class UserStoppedSpeakingFrame(SystemFrame):
     """Emitted by the VAD to indicate that a user stopped speaking."""
 
-    pass
+    emulated: bool = False
 
 
 @dataclass
