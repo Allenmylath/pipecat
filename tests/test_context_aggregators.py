@@ -31,17 +31,20 @@ from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
-from pipecat.services.anthropic import (
+from pipecat.services.anthropic.llm import (
     AnthropicAssistantContextAggregator,
     AnthropicLLMContext,
     AnthropicUserContextAggregator,
 )
-from pipecat.services.google.google import (
+from pipecat.services.google.llm import (
     GoogleAssistantContextAggregator,
     GoogleLLMContext,
     GoogleUserContextAggregator,
 )
-from pipecat.services.openai import OpenAIAssistantContextAggregator, OpenAIUserContextAggregator
+from pipecat.services.openai.llm import (
+    OpenAIAssistantContextAggregator,
+    OpenAIUserContextAggregator,
+)
 from pipecat.tests.utils import SleepFrame, run_test
 
 AGGREGATION_TIMEOUT = 0.1
