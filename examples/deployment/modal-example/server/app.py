@@ -1,3 +1,8 @@
+#
+# Copyright (c) 2024–2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
 """modal_example.
 
 This module shows a simple example of how to deploy a bot using Modal and FastAPI.
@@ -7,12 +12,6 @@ It includes:
 - Dynamic loading of bot implementations.
 - Use of a Daily transport for bot communication.
 """
-
-#
-# Copyright (c) 2024–2025, Daily
-#
-# SPDX-License-Identifier: BSD 2-Clause License
-#
 
 import importlib
 import os
