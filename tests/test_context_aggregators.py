@@ -8,8 +8,8 @@ import json
 import unittest
 from typing import Any
 
-import google.ai.generativelanguage as glm
-
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     EmulateUserStartedSpeakingFrame,
     EmulateUserStoppedSpeakingFrame,
@@ -20,13 +20,18 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     OpenAILLMContextAssistantTimestampFrame,
+    SpeechControlParamsFrame,
     StartInterruptionFrame,
     TextFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
-from pipecat.processors.aggregators.llm_response import LLMUserContextAggregator
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantAggregatorParams,
+    LLMUserAggregatorParams,
+    LLMUserContextAggregator,
+)
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
@@ -35,6 +40,11 @@ from pipecat.services.anthropic.llm import (
     AnthropicAssistantContextAggregator,
     AnthropicLLMContext,
     AnthropicUserContextAggregator,
+)
+from pipecat.services.aws.llm import (
+    AWSBedrockAssistantContextAggregator,
+    AWSBedrockLLMContext,
+    AWSBedrockUserContextAggregator,
 )
 from pipecat.services.google.llm import (
     GoogleAssistantContextAggregator,
@@ -163,7 +173,9 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
             UserStartedSpeakingFrame(),
             InterimTranscriptionFrame(text="How ", user_id="cat", timestamp=""),
@@ -189,7 +201,9 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
             UserStartedSpeakingFrame(),
             InterimTranscriptionFrame(text="How ", user_id="cat", timestamp=""),
@@ -216,7 +230,9 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
             UserStartedSpeakingFrame(),
             UserStoppedSpeakingFrame(),
@@ -240,7 +256,9 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
             UserStartedSpeakingFrame(),
             UserStoppedSpeakingFrame(),
@@ -265,8 +283,11 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
+            SpeechControlParamsFrame(vad_params=VADParams(stop_secs=AGGREGATION_TIMEOUT)),
             UserStartedSpeakingFrame(),
             TranscriptionFrame(text="Hello Pipecat!", user_id="cat", timestamp=""),
             SleepFrame(),
@@ -275,6 +296,7 @@ class BaseTestUserContextAggregator:
             SleepFrame(sleep=AGGREGATION_SLEEP),
         ]
         expected_down_frames = [
+            SpeechControlParamsFrame,
             UserStartedSpeakingFrame,
             UserStoppedSpeakingFrame,
             *self.EXPECTED_CONTEXT_FRAMES,
@@ -293,7 +315,9 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
             UserStartedSpeakingFrame(),
             UserStoppedSpeakingFrame(),
@@ -318,7 +342,9 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
+        )
         frames_to_send = [
             UserStartedSpeakingFrame(),
             InterimTranscriptionFrame(text="Hello ", user_id="cat", timestamp=""),
@@ -346,13 +372,52 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context
+        )  # No aggregation timeout; this tests VAD emulation
+
         frames_to_send = [
+            SpeechControlParamsFrame(vad_params=VADParams(stop_secs=AGGREGATION_TIMEOUT)),
             TranscriptionFrame(text="Hello!", user_id="cat", timestamp=""),
             SleepFrame(sleep=AGGREGATION_SLEEP),
         ]
-        expected_down_frames = [*self.EXPECTED_CONTEXT_FRAMES]
+        expected_down_frames = [
+            SpeechControlParamsFrame,
+            *self.EXPECTED_CONTEXT_FRAMES,
+        ]
         expected_up_frames = [EmulateUserStartedSpeakingFrame, EmulateUserStoppedSpeakingFrame]
+
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+            expected_up_frames=expected_up_frames,
+        )
+        self.check_message_content(context, 0, "Hello!")
+
+    async def test_t_with_turn_analyzer(self):
+        assert self.CONTEXT_CLASS is not None, "CONTEXT_CLASS must be set in a subclass"
+        assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
+
+        context = self.CONTEXT_CLASS()
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMUserAggregatorParams(turn_emulated_vad_timeout=AGGREGATION_TIMEOUT)
+        )
+
+        frames_to_send = [
+            SpeechControlParamsFrame(
+                vad_params=VADParams(stop_secs=0.2),
+                turn_params=SmartTurnParams(stop_secs=3.0),  # Turn analyzer present
+            ),
+            TranscriptionFrame(text="Hello!", user_id="cat", timestamp=""),
+            SleepFrame(sleep=AGGREGATION_SLEEP),
+        ]
+        expected_down_frames = [
+            SpeechControlParamsFrame,
+            *self.EXPECTED_CONTEXT_FRAMES,
+        ]
+        expected_up_frames = [EmulateUserStartedSpeakingFrame, EmulateUserStoppedSpeakingFrame]
+
         await run_test(
             aggregator,
             frames_to_send=frames_to_send,
@@ -366,14 +431,17 @@ class BaseTestUserContextAggregator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, aggregation_timeout=AGGREGATION_TIMEOUT)
+        aggregator = self.AGGREGATOR_CLASS(
+            context
+        )  # No aggregation timeout; this tests VAD emulation
         frames_to_send = [
+            SpeechControlParamsFrame(vad_params=VADParams(stop_secs=AGGREGATION_TIMEOUT)),
             InterimTranscriptionFrame(text="Hello ", user_id="cat", timestamp=""),
             SleepFrame(),
             TranscriptionFrame(text="Hello Pipecat!", user_id="cat", timestamp=""),
             SleepFrame(sleep=AGGREGATION_SLEEP),
         ]
-        expected_down_frames = [*self.EXPECTED_CONTEXT_FRAMES]
+        expected_down_frames = [SpeechControlParamsFrame, *self.EXPECTED_CONTEXT_FRAMES]
         expected_up_frames = [EmulateUserStartedSpeakingFrame, EmulateUserStoppedSpeakingFrame]
         await run_test(
             aggregator,
@@ -389,8 +457,7 @@ class BaseTestUserContextAggregator:
 
         context = self.CONTEXT_CLASS()
         aggregator = self.AGGREGATOR_CLASS(
-            context,
-            aggregation_timeout=AGGREGATION_TIMEOUT,
+            context, params=LLMUserAggregatorParams(aggregation_timeout=AGGREGATION_TIMEOUT)
         )
         frames_to_send = [
             UserStartedSpeakingFrame(),
@@ -469,7 +536,9 @@ class BaseTestAssistantContextAggreagator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, expect_stripped_words=False)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMAssistantAggregatorParams(expect_stripped_words=False)
+        )
         frames_to_send = [
             LLMFullResponseStartFrame(),
             TextFrame(text="Hello "),
@@ -513,7 +582,9 @@ class BaseTestAssistantContextAggreagator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, expect_stripped_words=False)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMAssistantAggregatorParams(expect_stripped_words=False)
+        )
         frames_to_send = [
             LLMFullResponseStartFrame(),
             TextFrame(text="Hello "),
@@ -538,7 +609,9 @@ class BaseTestAssistantContextAggreagator:
         assert self.AGGREGATOR_CLASS is not None, "AGGREGATOR_CLASS must be set in a subclass"
 
         context = self.CONTEXT_CLASS()
-        aggregator = self.AGGREGATOR_CLASS(context, expect_stripped_words=False)
+        aggregator = self.AGGREGATOR_CLASS(
+            context, params=LLMAssistantAggregatorParams(expect_stripped_words=False)
+        )
         frames_to_send = [
             LLMFullResponseStartFrame(),
             TextFrame(text="Hello "),
@@ -643,26 +716,6 @@ class TestLLMUserContextAggregator(BaseTestUserContextAggregator, unittest.Isola
 
 
 #
-# OpenAI
-#
-
-
-class TestOpenAIUserContextAggregator(
-    BaseTestUserContextAggregator, unittest.IsolatedAsyncioTestCase
-):
-    CONTEXT_CLASS = OpenAILLMContext
-    AGGREGATOR_CLASS = OpenAIUserContextAggregator
-
-
-class TestOpenAIAssistantContextAggregator(
-    BaseTestAssistantContextAggreagator, unittest.IsolatedAsyncioTestCase
-):
-    CONTEXT_CLASS = OpenAILLMContext
-    AGGREGATOR_CLASS = OpenAIAssistantContextAggregator
-    EXPECTED_CONTEXT_FRAMES = [OpenAILLMContextFrame, OpenAILLMContextAssistantTimestampFrame]
-
-
-#
 # Anthropic
 #
 
@@ -698,6 +751,43 @@ class TestAnthropicAssistantContextAggregator(
 
 
 #
+# AWS (Bedrock)
+#
+
+
+class TestAWSBedrockUserContextAggregator(
+    BaseTestUserContextAggregator, unittest.IsolatedAsyncioTestCase
+):
+    CONTEXT_CLASS = AWSBedrockLLMContext
+    AGGREGATOR_CLASS = AWSBedrockUserContextAggregator
+
+    def check_message_multi_content(
+        self, context: OpenAILLMContext, content_index: int, index: int, content: str
+    ):
+        messages = context.messages[content_index]
+        assert messages["content"][index]["text"] == content
+
+
+class TestAWSBedrockAssistantContextAggregator(
+    BaseTestAssistantContextAggreagator, unittest.IsolatedAsyncioTestCase
+):
+    CONTEXT_CLASS = AWSBedrockLLMContext
+    AGGREGATOR_CLASS = AWSBedrockAssistantContextAggregator
+    EXPECTED_CONTEXT_FRAMES = [OpenAILLMContextFrame, OpenAILLMContextAssistantTimestampFrame]
+
+    def check_message_multi_content(
+        self, context: OpenAILLMContext, content_index: int, index: int, content: str
+    ):
+        messages = context.messages[content_index]
+        assert messages["content"][index]["text"] == content
+
+    def check_function_call_result(self, context: OpenAILLMContext, index: int, content: Any):
+        assert context.messages[index]["content"][0]["toolResult"]["content"][0][
+            "text"
+        ] == json.dumps(content)
+
+
+#
 # Google
 #
 
@@ -709,13 +799,13 @@ class TestGoogleUserContextAggregator(
     AGGREGATOR_CLASS = GoogleUserContextAggregator
 
     def check_message_content(self, context: OpenAILLMContext, index: int, content: str):
-        obj = glm.Content.to_dict(context.messages[index])
+        obj = context.messages[index].to_json_dict()
         assert obj["parts"][0]["text"] == content
 
     def check_message_multi_content(
         self, context: OpenAILLMContext, content_index: int, index: int, content: str
     ):
-        obj = glm.Content.to_dict(context.messages[index])
+        obj = context.messages[index].to_json_dict()
         assert obj["parts"][0]["text"] == content
 
 
@@ -727,15 +817,35 @@ class TestGoogleAssistantContextAggregator(
     EXPECTED_CONTEXT_FRAMES = [OpenAILLMContextFrame, OpenAILLMContextAssistantTimestampFrame]
 
     def check_message_content(self, context: OpenAILLMContext, index: int, content: str):
-        obj = glm.Content.to_dict(context.messages[index])
+        obj = context.messages[index].to_json_dict()
         assert obj["parts"][0]["text"] == content
 
     def check_message_multi_content(
         self, context: OpenAILLMContext, content_index: int, index: int, content: str
     ):
-        obj = glm.Content.to_dict(context.messages[index])
+        obj = context.messages[index].to_json_dict()
         assert obj["parts"][0]["text"] == content
 
     def check_function_call_result(self, context: OpenAILLMContext, index: int, content: Any):
-        obj = glm.Content.to_dict(context.messages[index])
+        obj = context.messages[index].to_json_dict()
         assert obj["parts"][0]["function_response"]["response"]["value"] == json.dumps(content)
+
+
+#
+# OpenAI
+#
+
+
+class TestOpenAIUserContextAggregator(
+    BaseTestUserContextAggregator, unittest.IsolatedAsyncioTestCase
+):
+    CONTEXT_CLASS = OpenAILLMContext
+    AGGREGATOR_CLASS = OpenAIUserContextAggregator
+
+
+class TestOpenAIAssistantContextAggregator(
+    BaseTestAssistantContextAggreagator, unittest.IsolatedAsyncioTestCase
+):
+    CONTEXT_CLASS = OpenAILLMContext
+    AGGREGATOR_CLASS = OpenAIAssistantContextAggregator
+    EXPECTED_CONTEXT_FRAMES = [OpenAILLMContextFrame, OpenAILLMContextAssistantTimestampFrame]

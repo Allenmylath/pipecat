@@ -44,13 +44,12 @@ except ModuleNotFoundError as e:
 class AudioBuffer:
     """Buffer to collect audio frames before processing.
 
-    Attributes:
-        frames: List of AudioRawFrames to process
-        started_at: Timestamp when speech started
-        is_processing: Flag to prevent concurrent processing
+    Manages the collection and state of audio frames during speech
+    recording sessions, including timing and processing flags.
     """
 
     def __init__(self):
+        """Initialize the audio buffer."""
         self.frames: List[AudioRawFrame] = []
         self.started_at: Optional[float] = None
         self.is_processing: bool = False
@@ -59,19 +58,17 @@ class AudioBuffer:
 class UltravoxModel:
     """Model wrapper for the Ultravox multimodal model.
 
-    This class handles loading and running the Ultravox model for speech-to-text.
-
-    Args:
-        model_name: The name or path of the Ultravox model to load
-
-    Attributes:
-        model_name: The name of the loaded model
-        engine: The vLLM engine for model inference
-        tokenizer: The tokenizer for the model
-        stop_token_ids: Optional token IDs to stop generation
+    This class handles loading and running the Ultravox model for speech-to-text
+    transcription using vLLM for efficient inference.
     """
 
-    def __init__(self, model_name: str = "fixie-ai/ultravox-v0_4_1-llama-3_1-8b"):
+    def __init__(self, model_name: str = "fixie-ai/ultravox-v0_5-llama-3_1-8b"):
+        """Initialize the Ultravox model.
+
+        Args:
+            model_name: The name or path of the Ultravox model to load.
+                Defaults to "fixie-ai/ultravox-v0_5-llama-3_1-8b".
+        """
         self.model_name = model_name
         self._initialize_engine()
         self._initialize_tokenizer()
@@ -95,10 +92,10 @@ class UltravoxModel:
         """Format chat messages into a prompt for the model.
 
         Args:
-            messages: List of message dictionaries with 'role' and 'content'
+            messages: List of message dictionaries with 'role' and 'content'.
 
         Returns:
-            str: Formatted prompt string
+            str: Formatted prompt string ready for model input.
         """
         return self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -114,13 +111,13 @@ class UltravoxModel:
         """Generate text from audio input using the model.
 
         Args:
-            messages: List of message dictionaries
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
-            audio: Audio data as numpy array
+            messages: List of message dictionaries for conversation context.
+            temperature: Sampling temperature for generation randomness.
+            max_tokens: Maximum number of tokens to generate.
+            audio: Audio data as numpy array in float32 format.
 
         Yields:
-            str: JSON chunks of the generated response
+            str: JSON chunks of the generated response in OpenAI format.
         """
         sampling_params = SamplingParams(
             temperature=temperature, max_tokens=max_tokens, stop_token_ids=self.stop_token_ids
@@ -173,22 +170,9 @@ class UltravoxModel:
 class UltravoxSTTService(AIService):
     """Service to transcribe audio using the Ultravox multimodal model.
 
-    This service collects audio frames and processes them with Ultravox
-    to generate text transcriptions.
-
-    Args:
-        model_name: The Ultravox model to use (ModelSize enum or string)
-        hf_token: Hugging Face token for model access
-        temperature: Sampling temperature for generation
-        max_tokens: Maximum tokens to generate
-        **kwargs: Additional arguments passed to AIService
-
-    Attributes:
-        model: The UltravoxModel instance
-        buffer: Buffer to collect audio frames
-        temperature: Temperature for text generation
-        max_tokens: Maximum tokens to generate
-        _connection_active: Flag indicating if service is active
+    This service collects audio frames during speech and processes them with
+    Ultravox to generate text transcriptions. It handles real-time audio
+    buffering, model warm-up, and streaming text generation.
     """
 
     def __init__(
@@ -200,6 +184,17 @@ class UltravoxSTTService(AIService):
         max_tokens: int = 100,
         **kwargs,
     ):
+        """Initialize the UltravoxSTTService.
+
+        Args:
+            model_name: The Ultravox model to use. Defaults to
+                "fixie-ai/ultravox-v0_5-llama-3_1-8b".
+            hf_token: Hugging Face token for model access. If None, will try
+                to use HF_TOKEN environment variable.
+            temperature: Sampling temperature for generation. Defaults to 0.7.
+            max_tokens: Maximum tokens to generate. Defaults to 100.
+            **kwargs: Additional arguments passed to AIService.
+        """
         super().__init__(**kwargs)
 
         # Authenticate with Hugging Face if token provided
@@ -218,8 +213,59 @@ class UltravoxSTTService(AIService):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._connection_active = False
+        self._warm_up_duration_sec = 1
 
         logger.info(f"Initialized UltravoxSTTService with model: {model_name}")
+
+    async def _warm_up_model(self):
+        """Warm up the model with silent audio to improve first inference performance.
+
+        This method generates a short segment of silent audio and runs it through
+        the model to ensure the model is fully loaded and optimized for the first
+        real inference request.
+        """
+        logger.info("Warming up Ultravox model with silent audio...")
+
+        # Generate silent audio at 16kHz sample rate
+        sample_rate = 16000
+        silent_audio = self._generate_silent_audio(sample_rate, self._warm_up_duration_sec)
+
+        try:
+            # Process the silent audio with the model
+            messages = [{"role": "user", "content": "<|audio|>\n"}]
+            warmup_generator = self._model.generate(
+                messages=messages,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                audio=silent_audio,
+            )
+
+            # Consume the generator to actually run the inference
+            async for _ in warmup_generator:
+                pass
+
+            logger.info("Model warm-up completed successfully")
+        except Exception as e:
+            logger.warning(f"Model warm-up failed: {e}")
+
+    def _generate_silent_audio(self, sample_rate=16000, duration_sec=1.0):
+        """Generate silent audio as a numpy array.
+
+        Args:
+            sample_rate: Sample rate in Hz
+            duration_sec: Duration of silence in seconds
+
+        Returns:
+            np.ndarray: Float32 array of zeros representing silent audio
+        """
+        # Calculate number of samples
+        num_samples = int(sample_rate * duration_sec)
+
+        # Create silent audio as float32 in the [-1.0, 1.0] range
+        silent_audio = np.zeros(num_samples, dtype=np.float32)
+
+        logger.info(f"Generated {duration_sec}s of silent audio ({num_samples} samples)")
+        return silent_audio
 
     def can_generate_metrics(self) -> bool:
         """Indicates whether this service can generate metrics.
@@ -232,18 +278,26 @@ class UltravoxSTTService(AIService):
     async def start(self, frame: StartFrame):
         """Handle service start.
 
+        Starts the service, marks it as active, and performs model warm-up
+        to ensure optimal performance for the first inference.
+
         Args:
-            frame: StartFrame that triggered this method
+            frame: StartFrame that triggered this method.
         """
         await super().start(frame)
         self._connection_active = True
+
+        await self._warm_up_model()
+
         logger.info("UltravoxSTTService started")
 
     async def stop(self, frame: EndFrame):
         """Handle service stop.
 
+        Stops the service and marks it as inactive.
+
         Args:
-            frame: EndFrame that triggered this method
+            frame: EndFrame that triggered this method.
         """
         await super().stop(frame)
         self._connection_active = False
@@ -252,8 +306,10 @@ class UltravoxSTTService(AIService):
     async def cancel(self, frame: CancelFrame):
         """Handle service cancellation.
 
+        Cancels the service, clears any buffered audio, and marks it as inactive.
+
         Args:
-            frame: CancelFrame that triggered this method
+            frame: CancelFrame that triggered this method.
         """
         await super().cancel(frame)
         self._connection_active = False
@@ -263,11 +319,12 @@ class UltravoxSTTService(AIService):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames.
 
-        This method collects audio frames and processes them when speech ends.
+        This method collects audio frames during speech and processes them
+        when speech ends to generate text transcriptions.
 
         Args:
-            frame: The frame to process
-            direction: Direction of the frame (input/output)
+            frame: The frame to process.
+            direction: Direction of the frame (input/output).
         """
         await super().process_frame(frame, direction)
 
@@ -349,11 +406,12 @@ class UltravoxSTTService(AIService):
             if self._model:
                 try:
                     logger.info("Generating text from audio using model...")
-                    full_response = ""
 
                     # Start metrics tracking
                     await self.start_ttfb_metrics()
                     await self.start_processing_metrics()
+
+                    yield LLMFullResponseStartFrame()
 
                     async for response in self._model.generate(
                         messages=[{"role": "user", "content": "<|audio|>\n"}],
@@ -369,17 +427,11 @@ class UltravoxSTTService(AIService):
                             delta = chunk["choices"][0]["delta"]
                             if "content" in delta:
                                 new_text = delta["content"]
-                                full_response += new_text
+                                if new_text:
+                                    yield LLMTextFrame(text=new_text)
 
                     # Stop processing metrics after completion
                     await self.stop_processing_metrics()
-
-                    logger.info(f"Generated text: {full_response}")
-                    # Create a transcription frame with the generated text
-                    yield LLMFullResponseStartFrame()
-
-                    text_frame = LLMTextFrame(text=full_response.strip())
-                    yield text_frame
 
                     yield LLMFullResponseEndFrame()
 

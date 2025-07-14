@@ -4,23 +4,21 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+import argparse
 import os
-import sys
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.ultravox.stt import UltravoxSTTService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
@@ -28,8 +26,6 @@ load_dotenv(override=True)
 # The Ultravox model is compute-intensive and performs best with GPU acceleration.
 # This can be deployed on cloud GPU providers like Cerebrium.ai for optimal performance.
 
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
 
 # Want to initialize the ultravox processor since it takes time to load the model and dont
 # want to load it every time the pipeline is run
@@ -39,53 +35,68 @@ ultravox_processor = UltravoxSTTService(
 )
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        (room_url, token) = await configure(session)
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+}
 
-        transport = DailyTransport(
-            room_url,
-            token,
-            "Respond bot",
-            DailyParams(
-                audio_out_enabled=True,
-                transcription_enabled=False,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-                vad_audio_passthrough=True,
-            ),
-        )
 
-        tts = CartesiaTTSService(
-            api_key=os.environ.get("CARTESIA_API_KEY"),
-            voice_id="97f4b8fb-f2fe-444b-bb9a-c109783a857a",
-        )
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
 
-        pipeline = Pipeline(
-            [
-                transport.input(),  # Transport user input
-                ultravox_processor,
-                tts,  # TTS
-                transport.output(),  # Transport bot output
-            ]
-        )
+    tts = CartesiaTTSService(
+        api_key=os.environ.get("CARTESIA_API_KEY"),
+        voice_id="97f4b8fb-f2fe-444b-bb9a-c109783a857a",
+    )
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-            ),
-        )
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Transport user input
+            ultravox_processor,
+            tts,  # TTS
+            transport.output(),  # Transport bot output
+        ]
+    )
 
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(transport, participant, reason):
-            await task.cancel()
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
 
-        runner = PipelineRunner()
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info(f"Client connected")
 
-        await runner.run(task)
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=handle_sigint)
+
+    await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

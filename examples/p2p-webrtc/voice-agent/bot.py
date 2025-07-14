@@ -20,10 +20,6 @@ from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
 
 load_dotenv(override=True)
 
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
-
-
 SYSTEM_INSTRUCTION = f"""
 "You are Gemini Chatbot, a friendly, helpful robot.
 
@@ -41,9 +37,8 @@ async def run_bot(webrtc_connection):
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
+            audio_out_10ms_chunks=2,
         ),
     )
 
@@ -78,7 +73,8 @@ async def run_bot(webrtc_connection):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
         ),
     )
 
@@ -91,10 +87,6 @@ async def run_bot(webrtc_connection):
     @pipecat_transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Pipecat Client disconnected")
-
-    @pipecat_transport.event_handler("on_client_closed")
-    async def on_client_closed(transport, client):
-        logger.info("Pipecat Client closed")
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)

@@ -4,17 +4,14 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+import argparse
 import glob
 import json
 import os
-import sys
 from datetime import datetime
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -25,33 +22,33 @@ from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
 )
 from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
 
 BASE_FILENAME = "/tmp/pipecat_conversation_"
 tts = None
 
 
-async def fetch_weather_from_api(function_name, tool_call_id, args, llm, context, result_callback):
-    temperature = 75 if args["format"] == "fahrenheit" else 24
-    await result_callback(
+async def fetch_weather_from_api(params: FunctionCallParams):
+    temperature = 75 if params.arguments["format"] == "fahrenheit" else 24
+    await params.result_callback(
         {
             "conditions": "nice",
             "temperature": temperature,
-            "format": args["format"],
+            "format": params.arguments["format"],
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         }
     )
 
 
-async def get_saved_conversation_filenames(
-    function_name, tool_call_id, args, llm, context, result_callback
-):
+async def get_saved_conversation_filenames(params: FunctionCallParams):
     # Construct the full pattern including the BASE_FILENAME
     full_pattern = f"{BASE_FILENAME}*.json"
 
@@ -59,37 +56,39 @@ async def get_saved_conversation_filenames(
     matching_files = glob.glob(full_pattern)
     logger.debug(f"matching files: {matching_files}")
 
-    await result_callback({"filenames": matching_files})
+    await params.result_callback({"filenames": matching_files})
 
 
-async def save_conversation(function_name, tool_call_id, args, llm, context, result_callback):
+async def save_conversation(params: FunctionCallParams):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     filename = f"{BASE_FILENAME}{timestamp}.json"
-    logger.debug(f"writing conversation to {filename}\n{json.dumps(context.messages, indent=4)}")
+    logger.debug(
+        f"writing conversation to {filename}\n{json.dumps(params.context.messages, indent=4)}"
+    )
     try:
         with open(filename, "w") as file:
-            messages = context.get_messages_for_persistent_storage()
+            messages = params.context.get_messages_for_persistent_storage()
             # remove the last message, which is the instruction we just gave to save the conversation
             messages.pop()
             json.dump(messages, file, indent=2)
-        await result_callback({"success": True})
+        await params.result_callback({"success": True})
     except Exception as e:
-        await result_callback({"success": False, "error": str(e)})
+        await params.result_callback({"success": False, "error": str(e)})
 
 
-async def load_conversation(function_name, tool_call_id, args, llm, context, result_callback):
+async def load_conversation(params: FunctionCallParams):
     global tts
-    filename = args["filename"]
+    filename = params.arguments["filename"]
     logger.debug(f"loading conversation from {filename}")
     try:
         with open(filename, "r") as file:
-            context.set_messages(json.load(file))
+            params.context.set_messages(json.load(file))
             logger.debug(
-                f"loaded conversation from {filename}\n{json.dumps(context.messages, indent=4)}"
+                f"loaded conversation from {filename}\n{json.dumps(params.context.messages, indent=4)}"
             )
         await tts.say("Ok, I've loaded that conversation.")
     except Exception as e:
-        await result_callback({"success": False, "error": str(e)})
+        await params.result_callback({"success": False, "error": str(e)})
 
 
 messages = [
@@ -165,71 +164,87 @@ tools = [
 ]
 
 
-async def main():
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+    ),
+}
+
+
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
+
     global tts
-    async with aiohttp.ClientSession() as session:
-        (room_url, token) = await configure(session)
 
-        transport = DailyTransport(
-            room_url,
-            token,
-            "Respond bot",
-            DailyParams(
-                audio_out_enabled=True,
-                transcription_enabled=True,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
-            ),
-        )
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    )
 
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-        )
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    # you can either register a single function for all function calls, or specific functions
+    # llm.register_function(None, fetch_weather_from_api)
+    llm.register_function("get_current_weather", fetch_weather_from_api)
+    llm.register_function("save_conversation", save_conversation)
+    llm.register_function("get_saved_conversation_filenames", get_saved_conversation_filenames)
+    llm.register_function("load_conversation", load_conversation)
 
-        # you can either register a single function for all function calls, or specific functions
-        # llm.register_function(None, fetch_weather_from_api)
-        llm.register_function("get_current_weather", fetch_weather_from_api)
-        llm.register_function("save_conversation", save_conversation)
-        llm.register_function("get_saved_conversation_filenames", get_saved_conversation_filenames)
-        llm.register_function("load_conversation", load_conversation)
+    context = OpenAILLMContext(messages, tools)
+    context_aggregator = llm.create_context_aggregator(context)
 
-        context = OpenAILLMContext(messages, tools)
-        context_aggregator = llm.create_context_aggregator(context)
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Transport user input
+            stt,  # STT
+            context_aggregator.user(),
+            llm,  # LLM
+            tts,
+            transport.output(),  # Transport bot output
+            context_aggregator.assistant(),
+        ]
+    )
 
-        pipeline = Pipeline(
-            [
-                transport.input(),  # Transport user input
-                context_aggregator.user(),
-                llm,  # LLM
-                tts,
-                transport.output(),  # Transport bot output
-                context_aggregator.assistant(),
-            ]
-        )
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-                enable_usage_metrics=True,
-                # report_only_initial_ttfb=True,
-            ),
-        )
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info(f"Client connected")
+        # Kick off the conversation.
+        await task.queue_frames([context_aggregator.user().get_context_frame()])
 
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            await transport.capture_participant_transcription(participant["id"])
-            # Kick off the conversation.
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
 
-        runner = PipelineRunner()
+    runner = PipelineRunner(handle_sigint=handle_sigint)
 
-        await runner.run(task)
+    await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

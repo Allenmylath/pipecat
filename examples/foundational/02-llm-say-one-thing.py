@@ -4,14 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+import argparse
 import os
-import sys
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.frames.frames import EndFrame, LLMMessagesFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -19,46 +16,53 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(audio_out_enabled=True),
+    "twilio": lambda: FastAPIWebsocketParams(audio_out_enabled=True),
+    "webrtc": lambda: TransportParams(audio_out_enabled=True),
+}
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        (room_url, _) = await configure(session)
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
 
-        transport = DailyTransport(
-            room_url, None, "Say One Thing From an LLM", DailyParams(audio_out_enabled=True)
-        )
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    )
 
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-        )
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an LLM in a WebRTC session, and this is a 'hello world' demo. Say hello to the world.",
+        }
+    ]
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are an LLM in a WebRTC session, and this is a 'hello world' demo. Say hello to the world.",
-            }
-        ]
+    task = PipelineTask(Pipeline([llm, tts, transport.output()]))
 
-        runner = PipelineRunner()
+    # Register an event handler so we can play the audio when the client joins
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        await task.queue_frames([LLMMessagesFrame(messages), EndFrame()])
 
-        task = PipelineTask(Pipeline([llm, tts, transport.output()]))
+    runner = PipelineRunner(handle_sigint=handle_sigint)
 
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            await task.queue_frames([LLMMessagesFrame(messages), EndFrame()])
-
-        await runner.run(task)
+    await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

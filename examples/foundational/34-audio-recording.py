@@ -46,18 +46,15 @@ Note:
     handling merged and separate audio tracks respectively.
 """
 
-import asyncio
+import argparse
 import datetime
 import io
 import os
-import sys
 import wave
 
 import aiofiles
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
@@ -68,11 +65,11 @@ from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
 
 
 async def save_audio_file(audio: bytes, filename: str, sample_rate: int, num_channels: int):
@@ -89,102 +86,114 @@ async def save_audio_file(audio: bytes, filename: str, sample_rate: int, num_cha
         logger.info(f"Audio saved to {filename}")
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        (room_url, token) = await configure(session)
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+}
 
-        transport = DailyTransport(
-            room_url,
-            token,
-            "Recording bot",
-            DailyParams(
-                # audio_in_enabled=True,
-                audio_out_enabled=True,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(),
-                vad_audio_passthrough=True,
-            ),
-        )
 
-        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
 
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",
-        )
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
 
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4")
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",
+    )
 
-        # Create audio buffer processor
-        audiobuffer = AudioBufferProcessor()
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4")
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant demonstrating audio recording capabilities. Keep your responses brief and clear.",
-            },
+    # Create audio buffer processor
+    audiobuffer = AudioBufferProcessor()
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant demonstrating audio recording capabilities. Keep your responses brief and clear.",
+        },
+    ]
+
+    context = OpenAILLMContext(messages)
+    context_aggregator = llm.create_context_aggregator(context)
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            audiobuffer,  # Add audio buffer to pipeline
+            context_aggregator.assistant(),
         ]
+    )
 
-        context = OpenAILLMContext(messages)
-        context_aggregator = llm.create_context_aggregator(context)
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
 
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                context_aggregator.user(),
-                llm,
-                tts,
-                transport.output(),
-                audiobuffer,  # Add audio buffer to pipeline
-                context_aggregator.assistant(),
-            ]
-        )
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info(f"Client connected")
+        # Start recording audio
+        await audiobuffer.start_recording()
+        # Start conversation - empty prompt to let LLM follow system instructions
+        await task.queue_frames([context_aggregator.user().get_context_frame()])
 
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
 
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            await transport.capture_participant_transcription(participant["id"])
-            await audiobuffer.start_recording()
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Greet the user and explain that this conversation will be recorded.",
-                }
-            )
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
+    # Handler for merged audio
+    @audiobuffer.event_handler("on_audio_data")
+    async def on_audio_data(buffer, audio, sample_rate, num_channels):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recordings/merged_{timestamp}.wav"
+        os.makedirs("recordings", exist_ok=True)
+        await save_audio_file(audio, filename, sample_rate, num_channels)
 
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(transport, participant, reason):
-            await audiobuffer.stop_recording()
-            await task.cancel()
+    # Handler for separate tracks
+    @audiobuffer.event_handler("on_track_audio_data")
+    async def on_track_audio_data(buffer, user_audio, bot_audio, sample_rate, num_channels):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs("recordings", exist_ok=True)
 
-        # Handler for merged audio
-        @audiobuffer.event_handler("on_audio_data")
-        async def on_audio_data(buffer, audio, sample_rate, num_channels):
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"recordings/merged_{timestamp}.wav"
-            os.makedirs("recordings", exist_ok=True)
-            await save_audio_file(audio, filename, sample_rate, num_channels)
+        # Save user audio
+        user_filename = f"recordings/user_{timestamp}.wav"
+        await save_audio_file(user_audio, user_filename, sample_rate, 1)
 
-        # Handler for separate tracks
-        @audiobuffer.event_handler("on_track_audio_data")
-        async def on_track_audio_data(buffer, user_audio, bot_audio, sample_rate, num_channels):
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            os.makedirs("recordings", exist_ok=True)
+        # Save bot audio
+        bot_filename = f"recordings/bot_{timestamp}.wav"
+        await save_audio_file(bot_audio, bot_filename, sample_rate, 1)
 
-            # Save user audio
-            user_filename = f"recordings/user_{timestamp}.wav"
-            await save_audio_file(user_audio, user_filename, sample_rate, 1)
-
-            # Save bot audio
-            bot_filename = f"recordings/bot_{timestamp}.wav"
-            await save_audio_file(bot_audio, bot_filename, sample_rate, 1)
-
-        runner = PipelineRunner()
-        await runner.run(task)
+    runner = PipelineRunner(handle_sigint=handle_sigint)
+    await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

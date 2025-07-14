@@ -66,9 +66,7 @@ async def main():
             DailyParams(
                 audio_out_enabled=True,
                 audio_in_enabled=True,
-                camera_out_enabled=False,
-                vad_enabled=True,
-                vad_audio_passthrough=True,
+                video_out_enabled=False,
                 vad_analyzer=SileroVADAnalyzer(),
                 transcription_enabled=True,
                 #
@@ -95,7 +93,7 @@ async def main():
             # voice_id="gD1IexrzCvsXPHUuT0s3",
         )
 
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
         messages = [
             {
@@ -130,7 +128,15 @@ async def main():
             ]
         )
 
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=16000,
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+        )
 
         @audiobuffer.event_handler("on_audio_data")
         async def on_audio_data(buffer, audio, sample_rate, num_channels):

@@ -4,11 +4,20 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Google LLM service using OpenAI-compatible API format.
+
+This module provides integration with Google's AI LLM models using the OpenAI
+API format through Google's Gemini API OpenAI compatibility layer.
+"""
+
 import json
 import os
 
 from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
+
+from pipecat.services.llm_service import FunctionCallFromLLM
+from pipecat.utils.asyncio.watchdog_async_iterator import WatchdogAsyncIterator
 
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
@@ -18,13 +27,21 @@ from loguru import logger
 from pipecat.frames.frames import LLMTextFrame
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.openai.base_llm import OpenAIUnhandledFunctionException
 from pipecat.services.openai.llm import OpenAILLMService
 
 
 class GoogleLLMOpenAIBetaService(OpenAILLMService):
-    """This class implements inference with Google's AI LLM models using the OpenAI format.
-    Ref - https://ai.google.dev/gemini-api/docs/openai
+    """Google LLM service using OpenAI-compatible API format.
+
+    This service provides access to Google's AI LLM models (like Gemini) through
+    the OpenAI API format. It handles streaming responses, function calls, and
+    tool usage while maintaining compatibility with OpenAI's interface.
+
+    Note: This service includes a workaround for a Google API bug where function
+    call indices may be incorrectly set to None, resulting in empty function names.
+
+    Reference:
+        https://ai.google.dev/gemini-api/docs/openai
     """
 
     def __init__(
@@ -35,6 +52,14 @@ class GoogleLLMOpenAIBetaService(OpenAILLMService):
         model: str = "gemini-2.0-flash",
         **kwargs,
     ):
+        """Initialize the Google LLM service.
+
+        Args:
+            api_key: Google API key for authentication.
+            base_url: Base URL for Google's OpenAI-compatible API.
+            model: Google model name to use (e.g., "gemini-2.0-flash").
+            **kwargs: Additional arguments passed to the parent OpenAILLMService.
+        """
         super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
 
     async def _process_context(self, context: OpenAILLMContext):
@@ -52,7 +77,7 @@ class GoogleLLMOpenAIBetaService(OpenAILLMService):
             context
         )
 
-        async for chunk in chunk_stream:
+        async for chunk in WatchdogAsyncIterator(chunk_stream, manager=self.task_manager):
             if chunk.usage:
                 tokens = LLMTokenUsage(
                     prompt_tokens=chunk.usage.prompt_tokens,
@@ -112,25 +137,26 @@ class GoogleLLMOpenAIBetaService(OpenAILLMService):
             logger.debug(
                 f"Function list: {functions_list}, Arguments list: {arguments_list}, Tool ID list: {tool_id_list}"
             )
-            for index, (function_name, arguments, tool_id) in enumerate(
-                zip(functions_list, arguments_list, tool_id_list), start=1
+
+            function_calls = []
+            for function_name, arguments, tool_id in zip(
+                functions_list, arguments_list, tool_id_list
             ):
                 if function_name == "":
                     # TODO: Remove the _process_context method once Google resolves the bug
                     # where the index is incorrectly set to None instead of returning the actual index,
                     # which currently results in an empty function name('').
                     continue
-                if self.has_function(function_name):
-                    run_llm = False
-                    arguments = json.loads(arguments)
-                    await self.call_function(
+
+                arguments = json.loads(arguments)
+
+                function_calls.append(
+                    FunctionCallFromLLM(
                         context=context,
+                        tool_call_id=tool_id,
                         function_name=function_name,
                         arguments=arguments,
-                        tool_call_id=tool_id,
-                        run_llm=run_llm,
                     )
-                else:
-                    raise OpenAIUnhandledFunctionException(
-                        f"The LLM tried to call a function named '{function_name}', but there isn't a callback registered for that function."
-                    )
+                )
+
+            await self.run_function_calls(function_calls)

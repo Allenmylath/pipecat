@@ -65,6 +65,7 @@ export default async function handler(req, res) {
       From,
       callId,
       callDomain,
+      sipHeaders,
       dialout_settings,
       voicemail_detection,
       call_transfer
@@ -102,7 +103,8 @@ export default async function handler(req, res) {
       const sip_config = {
         display_name: From,
         sip_mode: 'dial-in',
-        num_endpoints: call_transfer !== null ? 2 : 1,
+        num_endpoints: (call_transfer !== undefined && call_transfer !== null) ? 2 : 1,
+        codecs: {"audio": ["OPUS"]},
       };
       daily_room_properties.sip = sip_config;
     }
@@ -116,6 +118,7 @@ export default async function handler(req, res) {
         dialout_settings,
         voicemail_detection,
         call_transfer,
+        sip_headers: sipHeaders,
       },
     };
 

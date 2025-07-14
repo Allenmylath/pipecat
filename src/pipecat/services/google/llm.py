@@ -4,26 +4,25 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Google Gemini integration for Pipecat.
+
+This module provides Google Gemini integration for the Pipecat framework,
+including LLM services, context management, and message aggregation.
+"""
+
 import base64
 import io
 import json
 import os
 import uuid
-
-from google.api_core.exceptions import DeadlineExceeded
-
-from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
-
-# Suppress gRPC fork warnings
-os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
-
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AudioRawFrame,
     Frame,
@@ -39,23 +38,39 @@ from pipecat.frames.frames import (
     VisionImageRawFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantAggregatorParams,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchResponseFrame
-from pipecat.services.llm_service import LLMService
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.openai.llm import (
     OpenAIAssistantContextAggregator,
     OpenAIUserContextAggregator,
 )
+from pipecat.utils.asyncio.watchdog_async_iterator import WatchdogAsyncIterator
+from pipecat.utils.tracing.service_decorators import traced_llm
+
+# Suppress gRPC fork warnings
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 try:
-    import google.ai.generativelanguage as glm
-    import google.generativeai as gai
-    from google.generativeai.types import GenerationConfig
-
+    from google import genai
+    from google.api_core.exceptions import DeadlineExceeded
+    from google.genai.types import (
+        Blob,
+        Content,
+        FunctionCall,
+        FunctionResponse,
+        GenerateContentConfig,
+        HttpOptions,
+        Part,
+    )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use Google AI, you need to `pip install pipecat-ai[google]`.")
@@ -63,11 +78,16 @@ except ModuleNotFoundError as e:
 
 
 class GoogleUserContextAggregator(OpenAIUserContextAggregator):
+    """Google-specific user context aggregator.
+
+    Extends OpenAI user context aggregator to handle Google AI's specific
+    Content and Part message format for user messages.
+    """
+
     async def push_aggregation(self):
+        """Push aggregated user text as a Google Content message."""
         if len(self._aggregation) > 0:
-            self._context.add_message(
-                glm.Content(role="user", parts=[glm.Part(text=self._aggregation)])
-            )
+            self._context.add_message(Content(role="user", parts=[Part(text=self._aggregation)]))
 
             # Reset the aggregation. Reset it before pushing it down, otherwise
             # if the tasks gets cancelled we won't be able to clear things up.
@@ -78,20 +98,36 @@ class GoogleUserContextAggregator(OpenAIUserContextAggregator):
             await self.push_frame(frame)
 
             # Reset our accumulator state.
-            self.reset()
+            await self.reset()
 
 
 class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
+    """Google-specific assistant context aggregator.
+
+    Extends OpenAI assistant context aggregator to handle Google AI's specific
+    Content and Part message format for assistant responses and function calls.
+    """
+
     async def handle_aggregation(self, aggregation: str):
-        self._context.add_message(glm.Content(role="model", parts=[glm.Part(text=aggregation)]))
+        """Handle aggregated assistant text response.
+
+        Args:
+            aggregation: The aggregated text response from the assistant.
+        """
+        self._context.add_message(Content(role="model", parts=[Part(text=aggregation)]))
 
     async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
+        """Handle function call in progress frame.
+
+        Args:
+            frame: Frame containing function call details.
+        """
         self._context.add_message(
-            glm.Content(
+            Content(
                 role="model",
                 parts=[
-                    glm.Part(
-                        function_call=glm.FunctionCall(
+                    Part(
+                        function_call=FunctionCall(
                             id=frame.tool_call_id, name=frame.function_name, args=frame.arguments
                         )
                     )
@@ -99,11 +135,11 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
             )
         )
         self._context.add_message(
-            glm.Content(
+            Content(
                 role="user",
                 parts=[
-                    glm.Part(
-                        function_response=glm.FunctionResponse(
+                    Part(
+                        function_response=FunctionResponse(
                             id=frame.tool_call_id,
                             name=frame.function_name,
                             response={"response": "IN_PROGRESS"},
@@ -114,6 +150,11 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
         )
 
     async def handle_function_call_result(self, frame: FunctionCallResultFrame):
+        """Handle function call result frame.
+
+        Args:
+            frame: Frame containing function call result.
+        """
         if frame.result:
             await self._update_function_call_result(
                 frame.function_name, frame.tool_call_id, frame.result
@@ -124,6 +165,11 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
             )
 
     async def handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
+        """Handle function call cancellation frame.
+
+        Args:
+            frame: Frame containing function call cancellation details.
+        """
         await self._update_function_call_result(
             frame.function_name, frame.tool_call_id, "CANCELLED"
         )
@@ -138,6 +184,11 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
                         part.function_response.response = {"value": json.dumps(result)}
 
     async def handle_user_image_frame(self, frame: UserImageRawFrame):
+        """Handle user image frame.
+
+        Args:
+            frame: Frame containing user image data and request context.
+        """
         await self._update_function_call_result(
             frame.request.function_name, frame.request.tool_call_id, "COMPLETED"
         )
@@ -151,28 +202,66 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
 
 @dataclass
 class GoogleContextAggregatorPair:
+    """Pair of Google context aggregators for user and assistant messages.
+
+    Parameters:
+        _user: User context aggregator for handling user messages.
+        _assistant: Assistant context aggregator for handling assistant responses.
+    """
+
     _user: GoogleUserContextAggregator
     _assistant: GoogleAssistantContextAggregator
 
     def user(self) -> GoogleUserContextAggregator:
+        """Get the user context aggregator.
+
+        Returns:
+            The user context aggregator instance.
+        """
         return self._user
 
     def assistant(self) -> GoogleAssistantContextAggregator:
+        """Get the assistant context aggregator.
+
+        Returns:
+            The assistant context aggregator instance.
+        """
         return self._assistant
 
 
 class GoogleLLMContext(OpenAILLMContext):
+    """Google AI LLM context that extends OpenAI context for Google-specific formatting.
+
+    This class handles conversion between OpenAI-style messages and Google AI's
+    Content/Part format, including system messages, function calls, and media.
+    """
+
     def __init__(
         self,
         messages: Optional[List[dict]] = None,
         tools: Optional[List[dict]] = None,
         tool_choice: Optional[dict] = None,
     ):
+        """Initialize GoogleLLMContext.
+
+        Args:
+            messages: Initial messages in OpenAI format.
+            tools: Available tools/functions for the model.
+            tool_choice: Tool choice configuration.
+        """
         super().__init__(messages=messages, tools=tools, tool_choice=tool_choice)
         self.system_message = None
 
     @staticmethod
     def upgrade_to_google(obj: OpenAILLMContext) -> "GoogleLLMContext":
+        """Upgrade an OpenAI context to a Google context.
+
+        Args:
+            obj: OpenAI LLM context to upgrade.
+
+        Returns:
+            GoogleLLMContext instance with converted messages.
+        """
         if isinstance(obj, OpenAILLMContext) and not isinstance(obj, GoogleLLMContext):
             logger.debug(f"Upgrading to Google: {obj}")
             obj.__class__ = GoogleLLMContext
@@ -180,14 +269,24 @@ class GoogleLLMContext(OpenAILLMContext):
         return obj
 
     def set_messages(self, messages: List):
+        """Set messages and restructure them for Google format.
+
+        Args:
+            messages: List of messages to set.
+        """
         self._messages[:] = messages
         self._restructure_from_openai_messages()
 
     def add_messages(self, messages: List):
+        """Add messages to the context, converting to Google format as needed.
+
+        Args:
+            messages: List of messages to add (can be mixed formats).
+        """
         # Convert each message individually
         converted_messages = []
         for msg in messages:
-            if isinstance(msg, glm.Content):
+            if isinstance(msg, Content):
                 # Already in Gemini format
                 converted_messages.append(msg)
             else:
@@ -200,9 +299,14 @@ class GoogleLLMContext(OpenAILLMContext):
         self._messages.extend(converted_messages)
 
     def get_messages_for_logging(self):
+        """Get messages formatted for logging with sensitive data redacted.
+
+        Returns:
+            List of message dictionaries with inline data redacted.
+        """
         msgs = []
         for message in self.messages:
-            obj = glm.Content.to_dict(message)
+            obj = message.to_json_dict()
             try:
                 if "parts" in obj:
                     for part in obj["parts"]:
@@ -216,19 +320,33 @@ class GoogleLLMContext(OpenAILLMContext):
     def add_image_frame_message(
         self, *, format: str, size: tuple[int, int], image: bytes, text: str = None
     ):
+        """Add an image message to the context.
+
+        Args:
+            format: Image format (e.g., 'RGB', 'RGBA').
+            size: Image dimensions as (width, height).
+            image: Raw image bytes.
+            text: Optional text to accompany the image.
+        """
         buffer = io.BytesIO()
         Image.frombytes(format, size, image).save(buffer, format="JPEG")
 
         parts = []
         if text:
-            parts.append(glm.Part(text=text))
-        parts.append(glm.Part(inline_data=glm.Blob(mime_type="image/jpeg", data=buffer.getvalue())))
+            parts.append(Part(text=text))
+        parts.append(Part(inline_data=Blob(mime_type="image/jpeg", data=buffer.getvalue())))
 
-        self.add_message(glm.Content(role="user", parts=parts))
+        self.add_message(Content(role="user", parts=parts))
 
     def add_audio_frames_message(
         self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
     ):
+        """Add audio frames as a message to the context.
+
+        Args:
+            audio_frames: List of audio frames to add.
+            text: Text description of the audio content.
+        """
         if not audio_frames:
             return
 
@@ -239,10 +357,10 @@ class GoogleLLMContext(OpenAILLMContext):
         data = b"".join(frame.audio for frame in audio_frames)
         # NOTE(aleix): According to the docs only text or inline_data should be needed.
         # (see https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference)
-        parts.append(glm.Part(text=text))
+        parts.append(Part(text=text))
         parts.append(
-            glm.Part(
-                inline_data=glm.Blob(
+            Part(
+                inline_data=Blob(
                     mime_type="audio/wav",
                     data=(
                         bytes(
@@ -252,7 +370,7 @@ class GoogleLLMContext(OpenAILLMContext):
                 )
             ),
         )
-        self.add_message(glm.Content(role="user", parts=parts))
+        self.add_message(Content(role="user", parts=parts))
         # message = {"mime_type": "audio/mp3", "data": bytes(data + create_wav_header(sample_rate, num_channels, 16, len(data)))}
         # self.add_message(message)
 
@@ -263,18 +381,48 @@ class GoogleLLMContext(OpenAILLMContext):
         System messages are stored separately and return None.
 
         Args:
-            message: Message in standard format:
-                {
-                    "role": "user/assistant/system/tool",
-                    "content": str | [{"type": "text/image_url", ...}] | None,
-                    "tool_calls": [{"function": {"name": str, "arguments": str}}]
-                }
+            message: Message in standard format.
 
         Returns:
-            glm.Content object with:
-                - role: "user" or "model" (converted from "assistant")
-                - parts: List[Part] containing text, inline_data, or function calls
-            Returns None for system messages.
+            Content object with role and parts, or None for system messages.
+
+        Examples:
+            Standard text message::
+
+                {
+                    "role": "user",
+                    "content": "Hello there"
+                }
+
+            Converts to Google Content with::
+
+                Content(
+                    role="user",
+                    parts=[Part(text="Hello there")]
+                )
+
+            Standard function call message::
+
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query": "test"}'
+                            }
+                        }
+                    ]
+                }
+
+            Converts to Google Content with::
+
+                Content(
+                    role="model",
+                    parts=[Part(function_call=FunctionCall(name="search", args={"query": "test"}))]
+                )
+
+            System message returns None and stores content in self.system_message.
         """
         role = message["role"]
         content = message.get("content", [])
@@ -288,8 +436,8 @@ class GoogleLLMContext(OpenAILLMContext):
         if message.get("tool_calls"):
             for tc in message["tool_calls"]:
                 parts.append(
-                    glm.Part(
-                        function_call=glm.FunctionCall(
+                    Part(
+                        function_call=FunctionCall(
                             name=tc["function"]["name"],
                             args=json.loads(tc["function"]["arguments"]),
                         )
@@ -298,30 +446,30 @@ class GoogleLLMContext(OpenAILLMContext):
         elif role == "tool":
             role = "model"
             parts.append(
-                glm.Part(
-                    function_response=glm.FunctionResponse(
+                Part(
+                    function_response=FunctionResponse(
                         name="tool_call_result",  # seems to work to hard-code the same name every time
                         response=json.loads(message["content"]),
                     )
                 )
             )
         elif isinstance(content, str):
-            parts.append(glm.Part(text=content))
+            parts.append(Part(text=content))
         elif isinstance(content, list):
             for c in content:
                 if c["type"] == "text":
-                    parts.append(glm.Part(text=c["text"]))
+                    parts.append(Part(text=c["text"]))
                 elif c["type"] == "image_url":
                     parts.append(
-                        glm.Part(
-                            inline_data=glm.Blob(
+                        Part(
+                            inline_data=Blob(
                                 mime_type="image/jpeg",
                                 data=base64.b64decode(c["image_url"]["url"].split(",")[1]),
                             )
                         )
                     )
 
-        message = glm.Content(role=role, parts=parts)
+        message = Content(role=role, parts=parts)
         return message
 
     def to_standard_messages(self, obj) -> list:
@@ -330,21 +478,73 @@ class GoogleLLMContext(OpenAILLMContext):
         Handles text, images, and function calls from Google's Content/Part objects.
 
         Args:
-            obj: Google Content object with:
-                - role: "model" (converted to "assistant") or "user"
-                - parts: List[Part] containing text, inline_data, or function calls
+            obj: Google Content object with role and parts.
 
         Returns:
-            List of messages in standard format:
-            [
-                {
-                    "role": "user/assistant/tool",
-                    "content": [
-                        {"type": "text", "text": str} |
-                        {"type": "image_url", "image_url": {"url": str}}
-                    ]
-                }
-            ]
+            List containing a single message in standard format.
+
+        Examples:
+            Google Content with text::
+
+                Content(
+                    role="user",
+                    parts=[Part(text="Hello")]
+                )
+
+            Converts to::
+
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hello"}]
+                    }
+                ]
+
+            Google Content with function call::
+
+                Content(
+                    role="model",
+                    parts=[Part(function_call=FunctionCall(name="search", args={"q": "test"}))]
+                )
+
+            Converts to::
+
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "search",
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": '{"q": "test"}'
+                                }
+                            }
+                        ]
+                    }
+                ]
+
+            Google Content with image::
+
+                Content(
+                    role="user",
+                    parts=[Part(inline_data=Blob(mime_type="image/jpeg", data=bytes_data))]
+                )
+
+            Converts to::
+
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/jpeg;base64,<encoded_data>"}
+                            }
+                        ]
+                    }
+                ]
         """
         msg = {"role": obj.role, "content": []}
         if msg["role"] == "model":
@@ -362,7 +562,7 @@ class GoogleLLMContext(OpenAILLMContext):
                     }
                 )
             elif part.function_call:
-                args = type(part.function_call).to_dict(part.function_call).get("args", {})
+                args = part.function_call.args if hasattr(part.function_call, "args") else {}
                 msg["tool_calls"] = [
                     {
                         "id": part.function_call.name,
@@ -377,7 +577,9 @@ class GoogleLLMContext(OpenAILLMContext):
             elif part.function_response:
                 msg["role"] = "tool"
                 resp = (
-                    type(part.function_response).to_dict(part.function_response).get("response", {})
+                    part.function_response.response
+                    if hasattr(part.function_response, "response")
+                    else {}
                 )
                 msg["tool_call_id"] = part.function_response.name
                 msg["content"] = json.dumps(resp)
@@ -409,7 +611,7 @@ class GoogleLLMContext(OpenAILLMContext):
 
         # Process each message, preserving Google-formatted messages and converting others
         for message in self._messages:
-            if isinstance(message, glm.Content):
+            if isinstance(message, Content):
                 # Keep existing Google-formatted messages (e.g., function calls/responses)
                 converted_messages.append(message)
                 continue
@@ -433,26 +635,35 @@ class GoogleLLMContext(OpenAILLMContext):
 
         # Add system message back as a user message if we only have function messages
         if self.system_message and not has_regular_messages:
-            self._messages.append(
-                glm.Content(role="user", parts=[glm.Part(text=self.system_message)])
-            )
+            self._messages.append(Content(role="user", parts=[Part(text=self.system_message)]))
 
         # Remove any empty messages
         self._messages = [m for m in self._messages if m.parts]
 
 
 class GoogleLLMService(LLMService):
-    """This class implements inference with Google's AI models.
+    """Google AI (Gemini) LLM service implementation.
 
-    This service translates internally from OpenAILLMContext to the messages format
-    expected by the Google AI model. We are using the OpenAILLMContext as a lingua
-    franca for all LLM services, so that it is easy to switch between different LLMs.
+    This class implements inference with Google's AI models, translating internally
+    from OpenAILLMContext to the messages format expected by the Google AI model.
+    We use OpenAILLMContext as a lingua franca for all LLM services to enable
+    easy switching between different LLMs.
     """
 
     # Overriding the default adapter to use the Gemini one.
     adapter_class = GeminiLLMAdapter
 
     class InputParams(BaseModel):
+        """Input parameters for Google AI models.
+
+        Parameters:
+            max_tokens: Maximum number of tokens to generate.
+            temperature: Sampling temperature between 0.0 and 2.0.
+            top_k: Top-k sampling parameter.
+            top_p: Top-p sampling parameter between 0.0 and 1.0.
+            extra: Additional parameters as a dictionary.
+        """
+
         max_tokens: Optional[int] = Field(default=4096, ge=1)
         temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
         top_k: Optional[int] = Field(default=None, ge=0)
@@ -463,18 +674,35 @@ class GoogleLLMService(LLMService):
         self,
         *,
         api_key: str,
-        model: str = "gemini-2.0-flash-001",
-        params: InputParams = InputParams(),
+        model: str = "gemini-2.0-flash",
+        params: Optional[InputParams] = None,
         system_instruction: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_config: Optional[Dict[str, Any]] = None,
+        http_options: Optional[HttpOptions] = None,
         **kwargs,
     ):
+        """Initialize the Google LLM service.
+
+        Args:
+            api_key: Google AI API key for authentication.
+            model: Model name to use. Defaults to "gemini-2.0-flash".
+            params: Input parameters for the model.
+            system_instruction: System instruction/prompt for the model.
+            tools: List of available tools/functions.
+            tool_config: Configuration for tool usage.
+            http_options: HTTP options for the client.
+            **kwargs: Additional arguments passed to parent class.
+        """
         super().__init__(**kwargs)
-        gai.configure(api_key=api_key)
+
+        params = params or GoogleLLMService.InputParams()
+
         self.set_model_name(model)
+        self._api_key = api_key
         self._system_instruction = system_instruction
-        self._create_client()
+        self._http_options = http_options
+        self._create_client(api_key, http_options)
         self._settings = {
             "max_tokens": params.max_tokens,
             "temperature": params.temperature,
@@ -486,19 +714,50 @@ class GoogleLLMService(LLMService):
         self._tool_config = tool_config
 
     def can_generate_metrics(self) -> bool:
+        """Check if the service can generate usage metrics.
+
+        Returns:
+            True, as Google AI provides token usage metrics.
+        """
         return True
 
-    def _create_client(self):
-        self._client = gai.GenerativeModel(
-            self._model_name, system_instruction=self._system_instruction
-        )
+    def _create_client(self, api_key: str, http_options: Optional[HttpOptions] = None):
+        self._client = genai.Client(api_key=api_key, http_options=http_options)
 
+    def needs_mcp_alternate_schema(self) -> bool:
+        """Check if this LLM service requires alternate MCP schema.
+
+        Google/Gemini has stricter JSON schema validation and requires
+        certain properties to be removed or modified for compatibility.
+
+        Returns:
+            True for Google/Gemini services.
+        """
+        return True
+
+    def _maybe_unset_thinking_budget(self, generation_params: Dict[str, Any]):
+        try:
+            # There's no way to introspect on model capabilities, so
+            # to check for models that we know default to thinkin on
+            # and can be configured to turn it off.
+            if not self._model_name.startswith("gemini-2.5-flash"):
+                return
+            # If thinking_config is already set, don't override it.
+            if "thinking_config" in generation_params:
+                return
+            generation_params.setdefault("thinking_config", {})["thinking_budget"] = 0
+        except Exception as e:
+            logger.exception(f"Failed to unset thinking budget: {e}")
+
+    @traced_llm
     async def _process_context(self, context: OpenAILLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
 
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
+        cache_read_input_tokens = 0
+        reasoning_tokens = 0
 
         grounding_metadata = None
         search_result = ""
@@ -513,23 +772,7 @@ class GoogleLLMService(LLMService):
             if context.system_message and self._system_instruction != context.system_message:
                 logger.debug(f"System instruction changed: {context.system_message}")
                 self._system_instruction = context.system_message
-                self._create_client()
 
-            # Filter out None values and create GenerationConfig
-            generation_params = {
-                k: v
-                for k, v in {
-                    "temperature": self._settings["temperature"],
-                    "top_p": self._settings["top_p"],
-                    "top_k": self._settings["top_k"],
-                    "max_output_tokens": self._settings["max_tokens"],
-                }.items()
-                if v is not None
-            }
-
-            generation_config = GenerationConfig(**generation_params) if generation_params else None
-
-            await self.start_ttfb_metrics()
             tools = []
             if context.tools:
                 tools = context.tools
@@ -538,112 +781,118 @@ class GoogleLLMService(LLMService):
             tool_config = None
             if self._tool_config:
                 tool_config = self._tool_config
-            response = await self._client.generate_content_async(
-                contents=messages,
-                tools=tools,
-                stream=True,
-                generation_config=generation_config,
-                tool_config=tool_config,
+
+            # Filter out None values and create GenerationContentConfig
+            generation_params = {
+                k: v
+                for k, v in {
+                    "system_instruction": self._system_instruction,
+                    "temperature": self._settings["temperature"],
+                    "top_p": self._settings["top_p"],
+                    "top_k": self._settings["top_k"],
+                    "max_output_tokens": self._settings["max_tokens"],
+                    "tools": tools,
+                    "tool_config": tool_config,
+                }.items()
+                if v is not None
+            }
+
+            if self._settings["extra"]:
+                generation_params.update(self._settings["extra"])
+
+            # possibly modify generation_params (in place) to set thinking to off by default
+            self._maybe_unset_thinking_budget(generation_params)
+
+            generation_config = (
+                GenerateContentConfig(**generation_params) if generation_params else None
             )
-            await self.stop_ttfb_metrics()
 
-            if response.usage_metadata:
-                # Use only the prompt token count from the response object
-                prompt_tokens = response.usage_metadata.prompt_token_count
-                total_tokens = prompt_tokens
+            await self.start_ttfb_metrics()
+            response = await self._client.aio.models.generate_content_stream(
+                model=self._model_name,
+                contents=messages,
+                config=generation_config,
+            )
 
-            async for chunk in response:
+            function_calls = []
+            async for chunk in WatchdogAsyncIterator(response, manager=self.task_manager):
+                # Stop TTFB metrics after the first chunk
+                await self.stop_ttfb_metrics()
                 if chunk.usage_metadata:
-                    # Use only the completion_tokens from the chunks. Prompt tokens are already counted and
-                    # are repeated here.
-                    completion_tokens += chunk.usage_metadata.candidates_token_count
-                    total_tokens += chunk.usage_metadata.candidates_token_count
-                try:
-                    for c in chunk.parts:
-                        if c.text:
-                            search_result += c.text
-                            await self.push_frame(LLMTextFrame(c.text))
-                        elif c.function_call:
-                            logger.debug(f"Function call: {c.function_call}")
-                            args = type(c.function_call).to_dict(c.function_call).get("args", {})
-                            await self.call_function(
-                                context=context,
-                                tool_call_id=str(uuid.uuid4()),
-                                function_name=c.function_call.name,
-                                arguments=args,
-                            )
-                    # Handle grounding metadata
-                    # It seems only the last chunk that we receive may contain this information
-                    # If the response doesn't include groundingMetadata, this means the response wasn't grounded.
-                    if chunk.candidates:
-                        for candidate in chunk.candidates:
-                            # logger.debug(f"candidate received: {candidate}")
-                            # Extract grounding metadata
-                            grounding_metadata = (
-                                {
-                                    "rendered_content": getattr(
-                                        getattr(candidate, "grounding_metadata", None),
-                                        "search_entry_point",
-                                        None,
-                                    ).rendered_content
-                                    if hasattr(
-                                        getattr(candidate, "grounding_metadata", None),
-                                        "search_entry_point",
-                                    )
-                                    else None,
-                                    "origins": [
-                                        {
-                                            "site_uri": getattr(grounding_chunk.web, "uri", None),
-                                            "site_title": getattr(
-                                                grounding_chunk.web, "title", None
-                                            ),
-                                            "results": [
-                                                {
-                                                    "text": getattr(
-                                                        grounding_support.segment, "text", ""
-                                                    ),
-                                                    "confidence": getattr(
-                                                        grounding_support, "confidence_scores", None
-                                                    ),
-                                                }
-                                                for grounding_support in getattr(
-                                                    getattr(candidate, "grounding_metadata", None),
-                                                    "grounding_supports",
-                                                    [],
-                                                )
-                                                if index
-                                                in getattr(
-                                                    grounding_support, "grounding_chunk_indices", []
-                                                )
-                                            ],
-                                        }
-                                        for index, grounding_chunk in enumerate(
-                                            getattr(
-                                                getattr(candidate, "grounding_metadata", None),
-                                                "grounding_chunks",
-                                                [],
-                                            )
-                                        )
-                                    ],
-                                }
-                                if getattr(candidate, "grounding_metadata", None)
-                                else None
-                            )
-                except Exception as e:
-                    # Google LLMs seem to flag safety issues a lot!
-                    if chunk.candidates[0].finish_reason == 3:
-                        logger.debug(
-                            f"LLM refused to generate content for safety reasons - {messages}."
-                        )
-                    else:
-                        logger.exception(f"{self} error: {e}")
+                    prompt_tokens += chunk.usage_metadata.prompt_token_count or 0
+                    completion_tokens += chunk.usage_metadata.candidates_token_count or 0
+                    total_tokens += chunk.usage_metadata.total_token_count or 0
+                    cache_read_input_tokens += chunk.usage_metadata.cached_content_token_count or 0
+                    reasoning_tokens += chunk.usage_metadata.thoughts_token_count or 0
 
+                if not chunk.candidates:
+                    continue
+
+                for candidate in chunk.candidates:
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            if not part.thought and part.text:
+                                search_result += part.text
+                                await self.push_frame(LLMTextFrame(part.text))
+                            elif part.function_call:
+                                function_call = part.function_call
+                                id = function_call.id or str(uuid.uuid4())
+                                logger.debug(f"Function call: {function_call.name}:{id}")
+                                function_calls.append(
+                                    FunctionCallFromLLM(
+                                        context=context,
+                                        tool_call_id=id,
+                                        function_name=function_call.name,
+                                        arguments=function_call.args or {},
+                                    )
+                                )
+
+                    if (
+                        candidate.grounding_metadata
+                        and candidate.grounding_metadata.grounding_chunks
+                    ):
+                        m = candidate.grounding_metadata
+                        rendered_content = (
+                            m.search_entry_point.rendered_content if m.search_entry_point else None
+                        )
+                        origins = [
+                            {
+                                "site_uri": grounding_chunk.web.uri
+                                if grounding_chunk.web
+                                else None,
+                                "site_title": grounding_chunk.web.title
+                                if grounding_chunk.web
+                                else None,
+                                "results": [
+                                    {
+                                        "text": grounding_support.segment.text
+                                        if grounding_support.segment
+                                        else "",
+                                        "confidence": grounding_support.confidence_scores,
+                                    }
+                                    for grounding_support in (
+                                        m.grounding_supports if m.grounding_supports else []
+                                    )
+                                    if grounding_support.grounding_chunk_indices
+                                    and index in grounding_support.grounding_chunk_indices
+                                ],
+                            }
+                            for index, grounding_chunk in enumerate(
+                                m.grounding_chunks if m.grounding_chunks else []
+                            )
+                        ]
+                        grounding_metadata = {
+                            "rendered_content": rendered_content,
+                            "origins": origins,
+                        }
+
+            await self.run_function_calls(function_calls)
         except DeadlineExceeded:
             await self._call_event_handler("on_completion_timeout")
         except Exception as e:
             logger.exception(f"{self} exception: {e}")
         finally:
-            if grounding_metadata is not None and isinstance(grounding_metadata, dict):
+            if grounding_metadata and isinstance(grounding_metadata, dict):
                 llm_search_frame = LLMSearchResponseFrame(
                     search_result=search_result,
                     origins=grounding_metadata["origins"],
@@ -656,11 +905,19 @@ class GoogleLLMService(LLMService):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
+                    cache_read_input_tokens=cache_read_input_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
             )
             await self.push_frame(LLMFullResponseEndFrame())
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process incoming frames and handle different frame types.
+
+        Args:
+            frame: The frame to process.
+            direction: Direction of frame processing.
+        """
         await super().process_frame(frame, direction)
 
         context = None
@@ -686,21 +943,18 @@ class GoogleLLMService(LLMService):
         self,
         context: OpenAILLMContext,
         *,
-        user_kwargs: Mapping[str, Any] = {},
-        assistant_kwargs: Mapping[str, Any] = {},
+        user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
+        assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
     ) -> GoogleContextAggregatorPair:
-        """Create an instance of GoogleContextAggregatorPair from an
-        OpenAILLMContext. Constructor keyword arguments for both the user and
-        assistant aggregators can be provided.
+        """Create Google-specific context aggregators.
+
+        Creates a pair of context aggregators optimized for Google's message format,
+        including support for function calls, tool usage, and image handling.
 
         Args:
-            context (OpenAILLMContext): The LLM context.
-            user_kwargs (Mapping[str, Any], optional): Additional keyword
-                arguments for the user context aggregator constructor. Defaults
-                to an empty mapping.
-            assistant_kwargs (Mapping[str, Any], optional): Additional keyword
-                arguments for the assistant context aggregator
-                constructor. Defaults to an empty mapping.
+            context: The LLM context to create aggregators for.
+            user_params: Parameters for user message aggregation.
+            assistant_params: Parameters for assistant message aggregation.
 
         Returns:
             GoogleContextAggregatorPair: A pair of context aggregators, one for
@@ -712,6 +966,6 @@ class GoogleLLMService(LLMService):
 
         if isinstance(context, OpenAILLMContext):
             context = GoogleLLMContext.upgrade_to_google(context)
-        user = GoogleUserContextAggregator(context, **user_kwargs)
-        assistant = GoogleAssistantContextAggregator(context, **assistant_kwargs)
+        user = GoogleUserContextAggregator(context, params=user_params)
+        assistant = GoogleAssistantContextAggregator(context, params=assistant_params)
         return GoogleContextAggregatorPair(_user=user, _assistant=assistant)

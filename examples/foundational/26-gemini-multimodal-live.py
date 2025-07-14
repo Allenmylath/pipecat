@@ -4,14 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+import argparse
 import os
-import sys
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -20,75 +17,107 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.gemini_multimodal_live.gemini import GeminiMultimodalLiveLLMService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
+# Load environment variables
 load_dotenv(override=True)
 
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        # set stop_secs to something roughly similar to the internal setting
+        # of the Multimodal Live api, just to align events.
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        # set stop_secs to something roughly similar to the internal setting
+        # of the Multimodal Live api, just to align events.
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        # set stop_secs to something roughly similar to the internal setting
+        # of the Multimodal Live api, just to align events.
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
+    ),
+}
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        (room_url, token) = await configure(session)
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
 
-        transport = DailyTransport(
-            room_url,
-            token,
-            "Respond bot",
-            DailyParams(
-                audio_out_enabled=True,
-                vad_enabled=True,
-                vad_audio_passthrough=True,
-                # set stop_secs to something roughly similar to the internal setting
-                # of the Multimodal Live api, just to align events. This doesn't really
-                # matter because we can only use the Multimodal Live API's phrase
-                # endpointing, for now.
-                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
-            ),
-        )
+    # Create the Gemini Multimodal Live LLM service
+    system_instruction = f"""
+    You are a helpful AI assistant.
+    Your goal is to demonstrate your capabilities in a helpful and engaging way.
+    Your output will be converted to audio so don't include special characters in your answers.
+    Respond to what the user said in a creative and helpful way.
+    """
 
-        llm = GeminiMultimodalLiveLLMService(
-            api_key=os.getenv("GOOGLE_API_KEY"),
-            # system_instruction="Talk like a pirate."
-        )
+    llm = GeminiMultimodalLiveLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        system_instruction=system_instruction,
+        voice_id="Puck",  # Aoede, Charon, Fenrir, Kore, Puck
+    )
 
-        pipeline = Pipeline(
+    # Build the pipeline
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            llm,
+            transport.output(),
+        ]
+    )
+
+    # Configure the pipeline task
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
+    # Handle client connection event
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info(f"Client connected")
+        # Kick off the conversation.
+        await task.queue_frames(
             [
-                transport.input(),
-                llm,
-                transport.output(),
+                LLMMessagesAppendFrame(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"Greet the user and introduce yourself.",
+                        }
+                    ]
+                )
             ]
         )
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-                enable_usage_metrics=True,
-            ),
-        )
+    # Handle client disconnection events
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
 
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            await task.queue_frames(
-                [
-                    LLMMessagesAppendFrame(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": "Greet the user.",
-                            }
-                        ]
-                    )
-                ]
-            )
-
-        runner = PipelineRunner()
-
-        await runner.run(task)
+    # Run the pipeline
+    runner = PipelineRunner(handle_sigint=handle_sigint)
+    await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

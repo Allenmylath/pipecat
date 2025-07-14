@@ -54,21 +54,26 @@ async def save_audio(server_name: str, audio: bytes, sample_rate: int, num_chann
         logger.info("No audio data to save")
 
 
-async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
+async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, testing: bool):
+    serializer = TwilioFrameSerializer(
+        stream_sid=stream_sid,
+        call_sid=call_sid,
+        account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
+        auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+    )
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
-            serializer=TwilioFrameSerializer(stream_sid),
+            serializer=serializer,
         ),
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
 
@@ -90,7 +95,7 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
 
     # NOTE: Watch out! This will save all the conversation in memory. You can
     # pass `buffer_size` to get periodic callbacks.
-    audiobuffer = AudioBufferProcessor(user_continuous_stream=not testing)
+    audiobuffer = AudioBufferProcessor()
 
     pipeline = Pipeline(
         [
@@ -110,7 +115,8 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
         params=PipelineParams(
             audio_in_sample_rate=8000,
             audio_out_sample_rate=8000,
-            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
         ),
     )
 

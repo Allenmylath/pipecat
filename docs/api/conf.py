@@ -1,5 +1,6 @@
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Configure logging
@@ -13,7 +14,8 @@ sys.path.insert(0, str(project_root / "src"))
 
 # Project information
 project = "pipecat-ai"
-copyright = "2024, Daily"
+current_year = datetime.now().year
+copyright = f"2024-{current_year}, Daily" if current_year > 2024 else "2024, Daily"
 author = "Daily"
 
 # General configuration
@@ -24,19 +26,20 @@ extensions = [
     "sphinx.ext.intersphinx",
 ]
 
+suppress_warnings = [
+    "autodoc.mocked_object",
+]
+
 # Napoleon settings
 napoleon_google_docstring = True
-napoleon_numpy_docstring = False
 napoleon_include_init_with_doc = True
 
 # AutoDoc settings
 autodoc_default_options = {
     "members": True,
     "member-order": "bysource",
-    "special-members": "__init__",
-    "undoc-members": True,
-    "exclude-members": "__weakref__",
-    "no-index": True,
+    "undoc-members": False,
+    "exclude-members": "__weakref__,model_config",
     "show-inheritance": True,
 }
 
@@ -50,7 +53,6 @@ autodoc_mock_imports = [
     "pyht.protos",
     "pyht.protos.api_pb2",
     "pipecat_ai_playht",  # PlayHT wrapper
-    "vllm",
     "aiortc",
     "aiortc.mediastreams",
     "cv2",
@@ -72,82 +74,145 @@ autodoc_mock_imports = [
     "langchain",
     "lmnt",
     "noisereduce",
-    "openai",
     "openpipe",
     "simli",
     "soundfile",
-    # Existing mocks
     "pipecat_ai_krisp",
     "pyaudio",
     "_tkinter",
     "tkinter",
     "daily",
     "daily_python",
-    "pydantic.BaseModel",
-    "pydantic.Field",
-    "pydantic._internal._model_construction",
-    "pydantic._internal._fields",
+    # Moondream dependencies
+    "torch",
+    "transformers",
+    "intel_extension_for_pytorch",
+    # Ultravox dependencies
+    "huggingface_hub",
+    "vllm",
+    "vllm.engine.arg_utils",
+    "transformers.AutoTokenizer",
+    # Langchain dependencies
+    "langchain_core",
+    "langchain_core.messages",
+    "langchain_core.runnables",
+    "langchain_core.messages.AIMessageChunk",
+    "langchain_core.runnables.Runnable",
+    # LiveKit dependencies
+    "livekit",
+    "livekit.rtc",
+    "livekit_api",
+    "livekit_protocol",
+    "tenacity",
+    "tenacity.retry",
+    "tenacity.stop_after_attempt",
+    "tenacity.wait_exponential",
+    "rtc",
+    "rtc.Room",
+    "rtc.RoomOptions",
+    "rtc.AudioSource",
+    "rtc.LocalAudioTrack",
+    "rtc.TrackPublishOptions",
+    "rtc.TrackSource",
+    "rtc.AudioStream",
+    "rtc.AudioFrameEvent",
+    "rtc.AudioFrame",
+    "rtc.Track",
+    "rtc.TrackKind",
+    "rtc.RemoteParticipant",
+    "rtc.RemoteTrackPublication",
+    "rtc.DataPacket",
+    # Riva dependencies
+    "riva",
+    "riva.client",
+    "riva.client.Auth",
+    "riva.client.ASRService",
+    "riva.client.StreamingRecognitionConfig",
+    "riva.client.RecognitionConfig",
+    "riva.client.AudioEncoding",
+    "riva.client.proto.riva_tts_pb2",
+    "riva.client.SpeechSynthesisService",
+    # Local CoreML Smart Turn dependencies
+    "coremltools",
+    "coremltools.models",
+    "coremltools.models.MLModel",
+    "torch",
+    "torch.nn",
+    "torch.nn.functional",
+    "transformers",
+    "transformers.AutoFeatureExtractor",
+    # Also add specific classes that are imported
+    "AutoFeatureExtractor",
+    # Sentry dependencies
+    "sentry_sdk",
+    # AWS Nova Sonic dependencies
+    "aws_sdk_bedrock_runtime",
+    "aws_sdk_bedrock_runtime.client",
+    "aws_sdk_bedrock_runtime.config",
+    "aws_sdk_bedrock_runtime.models",
+    "smithy_aws_core",
+    "smithy_aws_core.credentials_resolvers",
+    "smithy_aws_core.credentials_resolvers.static",
+    "smithy_aws_core.identity",
+    "smithy_core",
+    "smithy_core.aio",
+    "smithy_core.aio.eventstream",
+    # MCP dependencies (you may already have these)
+    "mcp",
+    "mcp.client",
+    "mcp.client.session_group",
+    "mcp.client.sse",
+    "mcp.client.stdio",
+    "mcp.ClientSession",
+    "mcp.StdioServerParameters",
+    # gstreamer
+    "gi",
+    "gi.require_version",
+    "gi.repository",
+    # Protobuf mocks
+    "pipecat.frames.protobufs.frames_pb2",
+    "pipecat.serializers.protobuf",
+    "google.protobuf",
+    "google.protobuf.descriptor",
+    "google.protobuf.descriptor_pool",
+    "google.protobuf.runtime_version",
+    "google.protobuf.symbol_database",
+    "google.protobuf.internal.builder",
 ]
 
 # HTML output settings
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
-autodoc_typehints = "description"
+autodoc_typehints = "signature"  # Show type hints in the signature only, not in the docstring
 html_show_sphinx = False
 
 
-def verify_modules():
-    """Verify that required modules are available."""
-    required_modules = {
-        "services": [
-            "assemblyai",
-            "aws",
-            "cartesia",
-            "deepgram",
-            "google",
-            "lmnt",
-            "riva",
-            "simli",
-        ],
-        "serializers": ["livekit"],
-        "vad": ["silero", "vad_analyzer"],
-        "transports": {
-            "services": ["daily", "livekit"],
-            "local": ["audio", "tk"],
-            "network": ["fastapi_websocket", "websocket_server"],
-        },
-    }
+def import_core_modules():
+    """Import core pipecat modules for autodoc to discover."""
+    core_modules = [
+        "pipecat",
+        "pipecat.frames",
+        "pipecat.pipeline",
+        "pipecat.processors",
+        "pipecat.services",
+        "pipecat.transports",
+        "pipecat.audio",
+        "pipecat.adapters",
+        "pipecat.clocks",
+        "pipecat.metrics",
+        "pipecat.observers",
+        "pipecat.serializers",
+        "pipecat.sync",
+        "pipecat.transcriptions",
+        "pipecat.utils",
+    ]
 
-    missing = []
-    for category, modules in required_modules.items():
-        if isinstance(modules, dict):
-            # Handle nested structure
-            for subcategory, submodules in modules.items():
-                for module in submodules:
-                    try:
-                        __import__(f"pipecat.{category}.{subcategory}.{module}")
-                        logger.info(
-                            f"Successfully imported pipecat.{category}.{subcategory}.{module}"
-                        )
-                    except (ImportError, TypeError, NameError) as e:
-                        missing.append(f"pipecat.{category}.{subcategory}.{module}")
-                        logger.warning(
-                            f"Optional module not available: pipecat.{category}.{subcategory}.{module} - {str(e)}"
-                        )
-        else:
-            # Handle flat structure
-            for module in modules:
-                try:
-                    __import__(f"pipecat.{category}.{module}")
-                    logger.info(f"Successfully imported pipecat.{category}.{module}")
-                except (ImportError, TypeError, NameError) as e:
-                    missing.append(f"pipecat.{category}.{module}")
-                    logger.warning(
-                        f"Optional module not available: pipecat.{category}.{module} - {str(e)}"
-                    )
-
-    if missing:
-        logger.warning(f"Some optional modules are not available: {missing}")
+    for module_name in core_modules:
+        try:
+            __import__(module_name)
+            logger.info(f"Successfully imported {module_name}")
+        except ImportError as e:
+            logger.warning(f"Failed to import {module_name}: {e}")
 
 
 def clean_title(title: str) -> str:
@@ -159,36 +224,7 @@ def clean_title(title: str) -> str:
     parts = title.split(".")
     title = parts[-1]
 
-    # Special cases for service names and common acronyms
-    special_cases = {
-        "ai": "AI",
-        "aws": "AWS",
-        "api": "API",
-        "vad": "VAD",
-        "assemblyai": "AssemblyAI",
-        "deepgram": "Deepgram",
-        "elevenlabs": "ElevenLabs",
-        "openai": "OpenAI",
-        "openpipe": "OpenPipe",
-        "playht": "PlayHT",
-        "xtts": "XTTS",
-        "lmnt": "LMNT",
-    }
-
-    # Check if the entire title is a special case
-    if title.lower() in special_cases:
-        return special_cases[title.lower()]
-
-    # Otherwise, capitalize each word
-    words = title.split("_")
-    cleaned_words = []
-    for word in words:
-        if word.lower() in special_cases:
-            cleaned_words.append(special_cases[word.lower()])
-        else:
-            cleaned_words.append(word.capitalize())
-
-    return " ".join(cleaned_words)
+    return title
 
 
 def setup(app):
@@ -213,9 +249,8 @@ def setup(app):
 
     excludes = [
         str(project_root / "src/pipecat/pipeline/to_be_updated"),
-        str(project_root / "src/pipecat/processors/gstreamer"),
-        str(project_root / "src/pipecat/services/to_be_updated"),
-        str(project_root / "src/pipecat/vad"),  # deprecated
+        str(project_root / "src/pipecat/examples"),
+        str(project_root / "src/pipecat/tests"),
         "**/test_*.py",
         "**/tests/*.py",
     ]
@@ -256,5 +291,4 @@ def setup(app):
         logger.error(f"Error generating API documentation: {e}", exc_info=True)
 
 
-# Run module verification
-verify_modules()
+import_core_modules()

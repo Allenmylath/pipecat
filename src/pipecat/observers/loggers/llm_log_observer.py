@@ -4,10 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""LLM logging observer for Pipecat."""
+
 from loguru import logger
 
 from pipecat.frames.frames import (
-    Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     LLMFullResponseEndFrame,
@@ -15,9 +16,9 @@ from pipecat.frames.frames import (
     LLMMessagesFrame,
     LLMTextFrame,
 )
-from pipecat.observers.base_observer import BaseObserver
+from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContextFrame
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
 
 
@@ -35,17 +36,21 @@ class LLMLogObserver(BaseObserver):
 
     This allows you to track when the LLM starts responding, what it generates,
     and when it finishes.
-
     """
 
-    async def on_push_frame(
-        self,
-        src: FrameProcessor,
-        dst: FrameProcessor,
-        frame: Frame,
-        direction: FrameDirection,
-        timestamp: int,
-    ):
+    async def on_push_frame(self, data: FramePushed):
+        """Handle frame push events and log LLM-related activities.
+
+        Args:
+            data: The frame push event data containing source, destination,
+                  frame, direction, and timestamp information.
+        """
+        src = data.source
+        dst = data.destination
+        frame = data.frame
+        direction = data.direction
+        timestamp = data.timestamp
+
         if not isinstance(src, LLMService) and not isinstance(dst, LLMService):
             return
 

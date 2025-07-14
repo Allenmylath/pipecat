@@ -4,14 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
-import sys
+import argparse
 import time
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -21,12 +18,11 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.whisper.stt import MLXModel, WhisperSTTServiceMLX
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
-
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
 
 
 STOP_SECS = 2.0
@@ -56,40 +52,53 @@ class TranscriptionLogger(FrameProcessor):
             self._last_transcription_time = time.time()
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        (room_url, _) = await configure(session)
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=STOP_SECS)),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=STOP_SECS)),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=STOP_SECS)),
+    ),
+}
 
-        transport = DailyTransport(
-            room_url,
-            None,
-            "Transcription bot",
-            DailyParams(
-                audio_in_enabled=True,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=STOP_SECS)),
-                vad_audio_passthrough=True,
-            ),
-        )
 
-        stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO)
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
 
-        tl = TranscriptionLogger()
+    stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO)
 
-        pipeline = Pipeline([transport.input(), stt, tl])
+    tl = TranscriptionLogger()
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                enable_metrics=True,
-                report_only_initial_ttfb=False,
-            ),
-        )
+    pipeline = Pipeline([transport.input(), stt, tl])
 
-        runner = PipelineRunner()
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
 
-        await runner.run(task)
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=handle_sigint)
+
+    await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

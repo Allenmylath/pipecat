@@ -26,6 +26,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.filters.stt_mute_filter import STTMuteConfig, STTMuteFilter, STTMuteStrategy
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.processors.transcript_processor import TranscriptProcessor
@@ -132,14 +133,21 @@ async def main():
             token,
             "Translator",
             DailyParams(
+                audio_in_enabled=True,
                 audio_out_enabled=True,
-                vad_enabled=True,
                 vad_analyzer=SileroVADAnalyzer(),
-                vad_audio_passthrough=True,
             ),
         )
 
         stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+
+        stt_mute_processor = STTMuteFilter(
+            config=STTMuteConfig(
+                strategies={
+                    STTMuteStrategy.ALWAYS,
+                }
+            ),
+        )
 
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
@@ -150,7 +158,7 @@ async def main():
         in_language = "English"
         out_language = "Spanish"
 
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
         context = OpenAILLMContext()
         context_aggregator = llm.create_context_aggregator(context)
 
@@ -170,6 +178,7 @@ async def main():
             [
                 transport.input(),
                 rtvi,
+                stt_mute_processor,  # We don't want to interrupt the translator bot
                 stt,
                 transcript.user(),  # User transcripts
                 tp,
@@ -184,7 +193,6 @@ async def main():
         task = PipelineTask(
             pipeline,
             params=PipelineParams(
-                allow_interruptions=False,  # We don't want to interrupt the translator bot
                 enable_metrics=True,
                 enable_usage_metrics=True,
             ),

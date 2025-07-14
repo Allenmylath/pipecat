@@ -6,12 +6,12 @@ import {
   TranscriptData,
   BotLLMTextData,
 } from '@pipecat-ai/client-js';
-import { useRTVIClient, useRTVIClientEvent } from '@pipecat-ai/client-react';
+import { usePipecatClient, useRTVIClientEvent } from '@pipecat-ai/client-react';
 import './DebugDisplay.css';
 
 export function DebugDisplay() {
   const debugLogRef = useRef<HTMLDivElement>(null);
-  const client = useRTVIClient();
+  const client = usePipecatClient();
 
   const log = useCallback((message: string) => {
     if (!debugLogRef.current) return;
@@ -76,7 +76,7 @@ export function DebugDisplay() {
   );
 
   useRTVIClientEvent(
-    RTVIEvent.TrackedStopped,
+    RTVIEvent.TrackStopped,
     useCallback(
       (track: MediaStreamTrack, participant?: Participant) => {
         log(

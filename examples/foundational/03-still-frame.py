@@ -4,59 +4,70 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+import argparse
 import os
-import sys
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.frames.frames import TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.fal.image import FalImageGenService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        video_out_enabled=True,
+        video_out_width=1024,
+        video_out_height=1024,
+    ),
+    "webrtc": lambda: TransportParams(
+        video_out_enabled=True,
+        video_out_width=1024,
+        video_out_height=1024,
+    ),
+}
 
 
-async def main():
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
+
+    # Create an HTTP session
     async with aiohttp.ClientSession() as session:
-        (room_url, _) = await configure(session)
-
-        transport = DailyTransport(
-            room_url,
-            None,
-            "Show a still frame image",
-            DailyParams(camera_out_enabled=True, camera_out_width=1024, camera_out_height=1024),
-        )
-
         imagegen = FalImageGenService(
             params=FalImageGenService.InputParams(image_size="square_hd"),
             aiohttp_session=session,
             key=os.getenv("FAL_KEY"),
         )
 
-        runner = PipelineRunner()
-
         task = PipelineTask(Pipeline([imagegen, transport.output()]))
 
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
+        # Register an event handler so we can play the audio when the client joins
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
             await task.queue_frame(TextFrame("a cat in the style of picasso"))
 
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(transport, participant, reason):
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected")
             await task.cancel()
+
+        runner = PipelineRunner(handle_sigint=handle_sigint)
 
         await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

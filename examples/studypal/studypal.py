@@ -112,9 +112,9 @@ async def main():
             token,
             "studypal",
             DailyParams(
+                audio_in_enabled=True,
                 audio_out_enabled=True,
                 transcription_enabled=True,
-                vad_enabled=True,
                 vad_analyzer=SileroVADAnalyzer(),
             ),
         )
@@ -157,8 +157,8 @@ Your task is to help the user understand and learn from this article in 2 senten
             pipeline,
             params=PipelineParams(
                 audio_out_sample_rate=44100,
-                allow_interruptions=True,
                 enable_metrics=True,
+                enable_usage_metrics=True,
             ),
         )
 

@@ -4,8 +4,15 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Pattern pair aggregator for processing structured content in streaming text.
+
+This module provides an aggregator that identifies and processes content between
+pattern pairs (like XML tags or custom delimiters) in streaming text, with
+support for custom handlers and configurable pattern removal.
+"""
+
 import re
-from typing import Callable, Optional, Tuple
+from typing import Awaitable, Callable, Optional, Tuple
 
 from loguru import logger
 
@@ -20,20 +27,15 @@ class PatternMatch:
     in the text. It contains information about which pattern was matched,
     the full matched text (including start and end patterns), and the
     content between the patterns.
-
-    Attributes:
-        pattern_id: The identifier of the matched pattern pair.
-        full_match: The complete text including start and end patterns.
-        content: The text content between the start and end patterns.
     """
 
     def __init__(self, pattern_id: str, full_match: str, content: str):
         """Initialize a pattern match.
 
         Args:
-            pattern_id: ID of the pattern pair.
-            full_match: Complete matched text including start and end patterns.
-            content: Content between the start and end patterns.
+            pattern_id: The identifier of the matched pattern pair.
+            full_match: The complete text including start and end patterns.
+            content: The text content between the start and end patterns.
         """
         self.pattern_id = pattern_id
         self.full_match = full_match
@@ -43,7 +45,7 @@ class PatternMatch:
         """Return a string representation of the pattern match.
 
         Returns:
-            A string describing the pattern match.
+            A descriptive string showing the pattern ID and content.
         """
         return f"PatternMatch(id={self.pattern_id}, content={self.content})"
 
@@ -66,6 +68,7 @@ class PatternPairAggregator(BaseTextAggregator):
         """Initialize the pattern pair aggregator.
 
         Creates an empty aggregator with no patterns or handlers registered.
+        Text buffering and pattern detection will begin when text is aggregated.
         """
         self._text = ""
         self._patterns = {}
@@ -76,7 +79,7 @@ class PatternPairAggregator(BaseTextAggregator):
         """Get the currently buffered text.
 
         Returns:
-            The current text buffer content.
+            The current text buffer content that hasn't been processed yet.
         """
         return self._text
 
@@ -106,7 +109,7 @@ class PatternPairAggregator(BaseTextAggregator):
         return self
 
     def on_pattern_match(
-        self, pattern_id: str, handler: Callable[[PatternMatch], None]
+        self, pattern_id: str, handler: Callable[[PatternMatch], Awaitable[None]]
     ) -> "PatternPairAggregator":
         """Register a handler for when a pattern pair is matched.
 
@@ -115,7 +118,7 @@ class PatternPairAggregator(BaseTextAggregator):
 
         Args:
             pattern_id: ID of the pattern pair to match.
-            handler: Function to call when pattern is matched.
+            handler: Async function to call when pattern is matched.
                      The function should accept a PatternMatch object.
 
         Returns:
@@ -124,17 +127,18 @@ class PatternPairAggregator(BaseTextAggregator):
         self._handlers[pattern_id] = handler
         return self
 
-    def _process_complete_patterns(self, text: str) -> Tuple[str, bool]:
+    async def _process_complete_patterns(self, text: str) -> Tuple[str, bool]:
         """Process all complete pattern pairs in the text.
 
         Searches for all complete pattern pairs in the text, calls the
         appropriate handlers, and optionally removes the matches.
 
         Args:
-            text: The text to process.
+            text: The text to process for pattern matches.
 
         Returns:
             Tuple of (processed_text, was_modified) where:
+
             - processed_text is the text after processing patterns
             - was_modified indicates whether any changes were made
         """
@@ -167,7 +171,7 @@ class PatternPairAggregator(BaseTextAggregator):
                 # Call the appropriate handler if registered
                 if pattern_id in self._handlers:
                     try:
-                        self._handlers[pattern_id](pattern_match)
+                        await self._handlers[pattern_id](pattern_match)
                     except Exception as e:
                         logger.error(f"Error in pattern handler for {pattern_id}: {e}")
 
@@ -185,7 +189,7 @@ class PatternPairAggregator(BaseTextAggregator):
         matching end patterns, which would indicate incomplete content.
 
         Args:
-            text: The text to check.
+            text: The text to check for incomplete patterns.
 
         Returns:
             True if there are incomplete patterns, False otherwise.
@@ -204,7 +208,7 @@ class PatternPairAggregator(BaseTextAggregator):
 
         return False
 
-    def aggregate(self, text: str) -> Optional[str]:
+    async def aggregate(self, text: str) -> Optional[str]:
         """Aggregate text and process pattern pairs.
 
         This method adds the new text to the buffer, processes any complete pattern
@@ -223,7 +227,7 @@ class PatternPairAggregator(BaseTextAggregator):
         self._text += text
 
         # Process any complete patterns in the buffer
-        processed_text, modified = self._process_complete_patterns(self._text)
+        processed_text, modified = await self._process_complete_patterns(self._text)
 
         # Only update the buffer if modifications were made
         if modified:
@@ -245,7 +249,7 @@ class PatternPairAggregator(BaseTextAggregator):
         # No complete sentence found yet
         return None
 
-    def handle_interruption(self):
+    async def handle_interruption(self):
         """Handle interruptions by clearing the buffer.
 
         Called when an interruption occurs in the processing pipeline,
@@ -253,10 +257,10 @@ class PatternPairAggregator(BaseTextAggregator):
         """
         self._text = ""
 
-    def reset(self):
+    async def reset(self):
         """Clear the internally aggregated text.
 
         Resets the aggregator to its initial state, discarding any
-        buffered text.
+        buffered text and clearing pattern tracking state.
         """
         self._text = ""

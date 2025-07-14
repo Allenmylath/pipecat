@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Piper TTS service implementation."""
+
 from typing import AsyncGenerator, Optional
 
 import aiohttp
@@ -17,18 +19,16 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.services.tts_service import TTSService
+from pipecat.utils.tracing.service_decorators import traced_tts
 
 
 # This assumes a running TTS service running: https://github.com/rhasspy/piper/blob/master/src/python_run/README_http.md
 class PiperTTSService(TTSService):
     """Piper TTS service implementation.
 
-    Provides integration with Piper's TTS server.
-
-    Args:
-        base_url: API base URL
-        aiohttp_session: aiohttp ClientSession
-        sample_rate: Output sample rate
+    Provides integration with Piper's HTTP TTS server for text-to-speech
+    synthesis. Supports streaming audio generation with configurable sample
+    rates and automatic WAV header removal.
     """
 
     def __init__(
@@ -41,6 +41,14 @@ class PiperTTSService(TTSService):
         sample_rate: Optional[int] = None,
         **kwargs,
     ):
+        """Initialize the Piper TTS service.
+
+        Args:
+            base_url: Base URL for the Piper TTS HTTP server.
+            aiohttp_session: aiohttp ClientSession for making HTTP requests.
+            sample_rate: Output sample rate. If None, uses the voice model's native rate.
+            **kwargs: Additional arguments passed to the parent TTSService.
+        """
         super().__init__(sample_rate=sample_rate, **kwargs)
 
         if base_url.endswith("/"):
@@ -52,16 +60,22 @@ class PiperTTSService(TTSService):
         self._settings = {"base_url": base_url}
 
     def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics.
+
+        Returns:
+            True, as Piper service supports metrics generation.
+        """
         return True
 
+    @traced_tts
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
-        """Generate speech from text using Piper API.
+        """Generate speech from text using Piper's HTTP API.
 
         Args:
-            text: The text to convert to speech
+            text: The text to convert to speech.
 
         Yields:
-            Frames containing audio data and status information
+            Frame: Audio frames containing the synthesized speech and status frames.
         """
         logger.debug(f"{self}: Generating TTS [{text}]")
         headers = {
@@ -72,19 +86,18 @@ class PiperTTSService(TTSService):
 
             async with self._session.post(self._base_url, data=text, headers=headers) as response:
                 if response.status != 200:
-                    eror = await response.text()
+                    error = await response.text()
                     logger.error(
-                        f"{self} error getting audio (status: {response.status}, error: {eror})"
+                        f"{self} error getting audio (status: {response.status}, error: {error})"
                     )
                     yield ErrorFrame(
-                        f"Error getting audio (status: {response.status}, error: {eror})"
+                        f"Error getting audio (status: {response.status}, error: {error})"
                     )
                     return
 
                 await self.start_tts_usage_metrics(text)
 
-                # Process the streaming response
-                CHUNK_SIZE = 1024
+                CHUNK_SIZE = self.chunk_size
 
                 yield TTSStartedFrame()
                 async for chunk in response.content.iter_chunked(CHUNK_SIZE):

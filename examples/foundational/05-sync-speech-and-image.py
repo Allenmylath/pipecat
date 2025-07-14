@@ -4,15 +4,13 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+import argparse
 import os
-import sys
 from dataclasses import dataclass
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from runner import configure
 
 from pipecat.frames.frames import (
     DataFrame,
@@ -30,12 +28,10 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.cartesia.tts import CartesiaHttpTTSService
 from pipecat.services.fal.image import FalImageGenService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
-
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
 
 
 @dataclass
@@ -67,23 +63,37 @@ class MonthPrepender(FrameProcessor):
             await self.push_frame(frame, direction)
 
 
-async def main():
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_out_enabled=True,
+        video_out_enabled=True,
+        video_out_width=1024,
+        video_out_height=1024,
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_out_enabled=True,
+        video_out_enabled=True,
+        video_out_width=1024,
+        video_out_height=1024,
+    ),
+}
+
+
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    """Run the Calendar Month Narration bot using WebRTC transport.
+
+    Args:
+        webrtc_connection: The WebRTC connection to use
+        room_name: Optional room name for display purposes
+    """
+    logger.info(f"Starting bot")
+
+    # Create an HTTP session for API calls
     async with aiohttp.ClientSession() as session:
-        (room_url, _) = await configure(session)
-
-        transport = DailyTransport(
-            room_url,
-            None,
-            "Month Narration Bot",
-            DailyParams(
-                audio_out_enabled=True,
-                camera_out_enabled=True,
-                camera_out_width=1024,
-                camera_out_height=1024,
-            ),
-        )
-
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
         tts = CartesiaHttpTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
@@ -144,14 +154,26 @@ async def main():
             frames.append(MonthFrame(month=month))
             frames.append(LLMMessagesFrame(messages))
 
-        runner = PipelineRunner()
-
         task = PipelineTask(pipeline)
 
-        await task.queue_frames(frames)
+        # Set up transport event handlers
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected")
+            # Start the month narration once connected
+            await task.queue_frames(frames)
 
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected")
+            await task.cancel()
+
+        # Run the pipeline
+        runner = PipelineRunner(handle_sigint=handle_sigint)
         await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from pipecat.examples.run import main
+
+    main(run_example, transport_params=transport_params)

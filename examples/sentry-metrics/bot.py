@@ -41,9 +41,7 @@ async def main():
             DailyParams(
                 audio_out_enabled=True,
                 audio_in_enabled=True,
-                camera_out_enabled=False,
-                vad_enabled=True,
-                vad_audio_passthrough=True,
+                video_out_enabled=False,
                 vad_analyzer=SileroVADAnalyzer(),
                 transcription_enabled=True,
             ),
@@ -51,7 +49,7 @@ async def main():
 
         # Initialize Sentry
         sentry_sdk.init(
-            dsn="your-project-dsn",
+            dsn=os.getenv("SENTRY_DSN"),
             traces_sample_rate=1.0,
         )
 
@@ -63,7 +61,6 @@ async def main():
 
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            model="gpt-4o",
             metrics=SentryMetrics(),
         )
 
@@ -90,7 +87,10 @@ async def main():
 
         task = PipelineTask(
             pipeline,
-            params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+            params=PipelineParams(
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
         )
 
         @transport.event_handler("on_first_participant_joined")

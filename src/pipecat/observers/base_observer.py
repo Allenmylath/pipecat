@@ -4,41 +4,67 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-from abc import ABC, abstractmethod
+"""Base observer classes for monitoring frame flow in the Pipecat pipeline.
+
+This module provides the foundation for observing frame transfers between
+processors without modifying the pipeline structure. Observers can be used
+for logging, debugging, analytics, and monitoring pipeline behavior.
+"""
+
+from abc import abstractmethod
+from dataclasses import dataclass
+
+from typing_extensions import TYPE_CHECKING
 
 from pipecat.frames.frames import Frame
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.utils.base_object import BaseObject
+
+if TYPE_CHECKING:
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
-class BaseObserver(ABC):
-    """This is the base class for pipeline frame observers. Observers can view
-    all the frames that go through the pipeline without the need to inject
-    processors in the pipeline. This can be useful, for example, to implement
-    frame loggers or debuggers among other things.
+@dataclass
+class FramePushed:
+    """Event data for frame transfers between processors in the pipeline.
 
+    Represents an event where a frame is pushed from one processor to another
+    within the pipeline. This data structure is typically used by observers
+    to track the flow of frames through the pipeline for logging, debugging,
+    or analytics purposes.
+
+    Parameters:
+        source: The processor sending the frame.
+        destination: The processor receiving the frame.
+        frame: The frame being transferred.
+        direction: The direction of the transfer (e.g., downstream or upstream).
+        timestamp: The time when the frame was pushed, based on the pipeline clock.
+    """
+
+    source: "FrameProcessor"
+    destination: "FrameProcessor"
+    frame: Frame
+    direction: "FrameDirection"
+    timestamp: int
+
+
+class BaseObserver(BaseObject):
+    """Base class for pipeline frame observers.
+
+    Observers can view all frames that flow through the pipeline without
+    needing to inject processors into the pipeline structure. This enables
+    non-intrusive monitoring capabilities such as frame logging, debugging,
+    performance analysis, and analytics collection.
     """
 
     @abstractmethod
-    async def on_push_frame(
-        self,
-        src: FrameProcessor,
-        dst: FrameProcessor,
-        frame: Frame,
-        direction: FrameDirection,
-        timestamp: int,
-    ):
-        """Abstract method to handle the event when a frame is pushed from one
-        processor to another.
+    async def on_push_frame(self, data: FramePushed):
+        """Handle the event when a frame is pushed from one processor to another.
+
+        This method should be implemented by subclasses to define specific
+        behavior (e.g., logging, monitoring, debugging) when a frame is
+        transferred through the pipeline.
 
         Args:
-            src (FrameProcessor): The source frame processor that is sending the frame.
-            dst (FrameProcessor): The destination frame processor that will receive the frame.
-            frame (Frame): The frame being transferred between processors.
-            direction (FrameDirection): The direction of the frame transfer.
-            timestamp (int): The timestamp when the frame was pushed (based on the pipeline clock).
-
-        This method should be implemented by subclasses to define specific behavior
-        when a frame is pushed.
-
+            data: The event data containing details about the frame transfer.
         """
         pass
