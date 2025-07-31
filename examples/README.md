@@ -22,7 +22,7 @@ See the **[Foundational Examples README](foundational/)** for the complete list.
 
 ## More Advanced Examples
 
-Ready to explore complex use cases? Visit **[pipecat-examples](https://github.com/pipecat-ai/pipecat-examples)** for:
+Ready to explore complex use cases? Visit **<a href="https://github.com/pipecat-ai/pipecat-examples" target="_blank" rel="noopener noreferrer">pipecat-examples</a>** for:
 
 - Production-ready applications
 - Multi-platform client implementations
